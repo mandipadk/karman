@@ -45,6 +45,10 @@ struct ContentView: View {
                 Button("Import STL…") { controller.beginImport() }
                 Button("Export QoIs…") { controller.exportCSV() }
                     .disabled(!controller.hasHistory)
+                Button(controller.hardening ? "Hardening…" : "Harden this number") {
+                    controller.harden()
+                }
+                .disabled(controller.hardening || !controller.canHarden)
                 Spacer()
             }
             .padding(10)
@@ -66,6 +70,9 @@ struct ContentView: View {
                 Spacer()
             }
             .padding(10)
+            Divider()
+            TruthPanel()
+                .padding(10)
         }
         .frame(minWidth: 980, minHeight: 380)
         .onChange(of: controller.selectedCase) { controller.selectBuiltin() }
@@ -106,6 +113,43 @@ struct UnitsSheet: View {
         }
         .padding(20)
         .frame(width: 430)
+    }
+}
+
+/// The truth panel: what the number is worth. Empty until you harden it —
+/// because an error bar the tool has not earned is worse than none.
+struct TruthPanel: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        HStack(alignment: .top, spacing: 20) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Truth").font(.headline)
+                if controller.hardening {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(controller.hardenStatus)
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                } else if let h = controller.headline {
+                    Text(h)
+                        .font(.system(.body, design: .monospaced).bold())
+                        .foregroundStyle(controller.outsideDomain ? .orange : .primary)
+                    ForEach(controller.truthLines, id: \.self) { line in
+                        Text(line).font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Save credibility report…") { controller.saveReport() }
+                        .padding(.top, 2)
+                } else if controller.canHarden {
+                    Text("Press “Harden this number” to run a resolution ladder and a Mach anchor (minutes) and earn an error bar.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("This case has no ladderable QoI yet.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+        }
     }
 }
 
@@ -193,6 +237,15 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var stlFluid: Int = 0
     private var stlURL: URL?
     private var stlMesh: StlMesh?
+    // Truth panel
+    @Published var hardening = false
+    @Published var hardenStatus = ""
+    @Published var headline: String?
+    @Published var truthLines: [String] = []
+    @Published var outsideDomain = false
+    private var lastRun: CredibilityRun?
+    /// Only cases with a ladderable definition can be hardened.
+    var canHarden: Bool { selectedCase == .street && stlMesh == nil }
     /// Rebuilds the current case (builtin picker choice or imported STL).
     private var currentBuilder: (() throws -> ActiveCase)!
     var hasHistory: Bool { !history.isEmpty }
@@ -239,6 +292,12 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
                 selectedCase = fc
                 selectBuiltin()
             }
+            if ProcessInfo.processInfo.environment["STROUHAL_APP_HARDEN"] != nil {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(1))
+                    self?.harden()
+                }
+            }
             if let stl = ProcessInfo.processInfo.environment["STROUHAL_APP_STL"] {
                 stlChosen(URL(fileURLWithPath: stl))
                 showUnitsSheet = false
@@ -249,6 +308,8 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
                 print("AUTOTEST \(self?.statsLine ?? "") | \(self?.qoiLine ?? "")")
                 print("SETUP    \(self?.setupLine ?? "")")
                 print("ENVELOPE \(self?.envelopeLine ?? "")")
+                if let h = self?.headline { print("TRUTH    \(h)") }
+                for l in self?.truthLines ?? [] { print("         \(l)") }
                 exit(0)
             }
         }
@@ -353,6 +414,75 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         }
         reset()
     }
+
+    /// Run the resolution ladder + Mach anchor on a BACKGROUND GPU queue so
+    /// the live view keeps animating. (This is the use case that finally
+    /// justifies a second command queue — M3's rendering never needed one.)
+    func harden() {
+        guard canHarden else { return }
+        hardening = true
+        hardenStatus = "starting…"
+        headline = nil
+        truthLines = []
+        let ladderCase = StreetLadder()
+        Task.detached(priority: .userInitiated) {
+            do {
+                let bgGPU = try GPU()   // its own device queue: never blocks the render loop
+                let run = try Ladder.credibility(gpu: bgGPU, case: ladderCase,
+                                                 qoi: "mean C_D",
+                                                 resolutions: [32, 48, 64]) { msg in
+                    Task { @MainActor in self.hardenStatus = msg }
+                }
+                await MainActor.run { self.finishHarden(run) }
+            } catch {
+                await MainActor.run {
+                    self.hardening = false
+                    self.hardenStatus = "failed: \(error)"
+                }
+            }
+        }
+    }
+
+    private func finishHarden(_ run: CredibilityRun) {
+        lastRun = run
+        hardening = false
+        let b = run.budget
+        headline = b.headline
+        if case .outside = b.verdict { outsideDomain = true } else { outsideDomain = false }
+        var lines: [String] = []
+        lines.append(String(format: "u_num %.4f · u_stat %.4f · u_Ma %.4f  →  U(φ) = k·√Σu² with k = 2",
+                            b.uNum, b.uStat, b.uMa))
+        lines.append("ladder: " + run.rungs.map { String(format: "%d→%.4f", $0.cellsPerFeature, $0.value) }
+                        .joined(separator: "  ")
+                     + String(format: "   half-Mach: %.4f→%.4f", run.machBaseline, run.machHalf))
+        switch b.verdict {
+        case .inside(let a): lines.append("validation domain: inside — \(a)")
+        case .nearEdge(let a, let f): lines.append(String(format: "validation domain: near edge of %@ — bar inflated ×%.2f", a, f))
+        case .outside(let r): lines.append("validation domain: OUTSIDE — " + r.joined(separator: "; "))
+        }
+        lines.append(String(format: "no Richardson/GCI (invalid for scale-resolving runs) · no model-form uncertainty · %.0f s", run.wallSeconds))
+        for n in b.notes where !n.isEmpty && !n.hasPrefix("u_num =") { lines.append("⚠ " + n) }
+        truthLines = lines
+    }
+
+    func saveReport() {
+        guard let run = lastRun else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "credibility-report.md"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let md = CredibilityReport.markdown(run, buildGates: Self.buildGates)
+        try? md.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// The gates this build passes — embedded in every report.
+    static let buildGates = [
+        "Ghia cavity Re=1000: centerline RMS 0.0039 of u_lid",
+        "Poiseuille (TRT Λ=3/16): wall error 4.3e-7",
+        "Taylor–Green: observed order 1.96",
+        "Schäfer–Turek 2D-1: C_D within 0.16% (NT curved boundaries)",
+        "Schäfer–Turek 2D-2: St 0.2996, max C_L 0.9998",
+        "Determinism: run-twice state digests identical",
+    ]
 
     func exportCSV() {
         let panel = NSSavePanel()

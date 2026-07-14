@@ -45,6 +45,9 @@ func main() throws {
         let ds = args.dropFirst().first.flatMap { Int($0) } ?? 24
         let bx = args.dropFirst(2).first.flatMap { Int($0) } ?? (ds * 4)
         results = [try runSphere(gpu: gpu, D: ds, box: bx)]
+    case "m4":
+        print("— the credibility run (resolution ladder + Mach anchor) —")
+        results = try runCredibility(gpu: gpu)
     case "genstl":
         let path = args.dropFirst().first ?? "/tmp/testsphere.stl"
         try sphereSTLData(radius: 1.0).write(to: URL(fileURLWithPath: path))

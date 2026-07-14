@@ -157,3 +157,46 @@ public struct CavityCase {
         self.re = re
     }
 }
+
+/// The vortex street as a ladderable case: rebuild at any resolution and any
+/// Mach scale, probe mean C_D. This is the reference implementation of
+/// `LadderableCase` and what the M4 credibility gate exercises.
+public struct StreetLadder: LadderableCase {
+    public let re: Double
+    public let baseMach: Double
+    public init(re: Double = 100, baseMach: Double = 0.075) {
+        self.re = re
+        self.baseMach = baseMach
+    }
+
+    public var setupDescription: String {
+        String(format: "Schäfer–Turek DFG 2D-2 · cylinder in a channel · Re %.0f · velocity-wall inlet and outlet · NT curved body · outlet sponge · cosine ramp", re)
+    }
+    public var geometryClass: String { "bluff body in channel" }
+
+    public func variant(gpu: GPU, cellsPerFeature: Int, machScale: Double) throws -> LadderVariant {
+        let u = Float(baseMach * machScale)
+        let c = try VortexStreetCase(gpu: gpu, D: cellsPerFeature, uinMax: u, re: re)
+        // Physical time is what matters: at half the lattice velocity the flow
+        // needs twice the steps to travel the same distance, and a finer grid
+        // needs proportionally more steps again (diffusive scaling of the
+        // convective time). Scale the schedule so every rung sees the same
+        // number of shedding cycles.
+        let scale = Double(cellsPerFeature) / 40.0 / machScale
+        let transient = Int(60_000 * scale) & ~1
+        // Sample ~45 shedding cycles: batch means need batches several cycles
+        // long to decorrelate, and 22 cycles could not supply that (measured
+        // lag-1 ρ = 0.61 at 12 batches).
+        let sample = Int(120_000 * scale) & ~1
+        let stride = max(8, Int(26 * scale)) & ~1
+        let uMean = c.uMean
+        return LadderVariant(
+            sim: c.sim,
+            mach: Double(u) * 2.0 / 3.0 * 3.0.squareRoot(),  // Ma of U_mean
+            probe: { sim in
+                let f = try sim.probeForce(xRange: c.boxX, yRange: c.boxY)
+                return 2.0 * f.x / (uMean * uMean * Double(cellsPerFeature))
+            },
+            transientSteps: transient, sampleSteps: sample, stride: stride)
+    }
+}
