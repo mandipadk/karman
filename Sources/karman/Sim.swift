@@ -8,14 +8,16 @@ enum Precision: String {
 }
 
 struct Params {
-    var nx: UInt32, ny: UInt32, nz: UInt32
-    var parity: UInt32
+    var nx: UInt32, ny: UInt32, nz: UInt32, parity: UInt32
     var omega: Float
     var omegaMinus: Float
     var ulid: Float
-    var fx: Float
-    var fy: Float = 0, fz: Float = 0
-    var pad0: UInt32 = 0, pad1: UInt32 = 0
+    var uin: Float
+    var fx: Float, fy: Float, fz: Float
+    var outBlend: Float
+    var writeForce: UInt32
+    var rhoIn: Float = 1.0
+    var pad1: UInt32 = 0, pad2: UInt32 = 0
 }
 
 struct InitParams {
@@ -28,13 +30,16 @@ struct InitParams {
 enum Cell: UInt8 {
     case fluid = 0
     case solid = 1
-    case lid = 2 // solid + moving (+x)
+    case lid = 2     // solid + moving (+x)
+    case inflow = 3  // velocity Dirichlet, parabolic +x profile
+    case outflow = 4 // zero-gradient copy of the -x neighbor
 }
 
 struct Pipelines {
     let step: MTLComputePipelineState
     let moments: MTLComputePipelineState
     let initField: MTLComputePipelineState
+    let outflowCopy: MTLComputePipelineState
 }
 
 final class GPU {
@@ -74,7 +79,8 @@ final class GPU {
         }
         let p = Pipelines(step: try pipeline("step"),
                           moments: try pipeline("momentsEven"),
-                          initField: try pipeline("initField"))
+                          initField: try pipeline("initField"),
+                          outflowCopy: try pipeline("outflowCopy"))
         pipelines[precision] = p
         return p
     }
@@ -120,8 +126,13 @@ final class Simulation {
     var omega: Float
     var omegaMinus: Float
     var ulidTarget: Float
+    var uinTarget: Float
     var rampSteps: Int
     var force: SIMD3<Float>
+    var outBlend: Float = 1.0
+    var rhoIn: Float = 1.0
+    let hasOutflow: Bool
+    let forceBuf: MTLBuffer
     private(set) var stepsDone: Int = 0
     private let runState = RunState()
     var gpuSeconds: Double { runState.gpuSeconds }
@@ -143,7 +154,8 @@ final class Simulation {
 
     init(gpu: GPU, precision: Precision = .fp32, nx: Int, ny: Int, nz: Int,
          omega: Float, omegaMinus: Float? = nil,
-         ulid: Float = 0, rampSteps: Int = 0, force: SIMD3<Float> = .zero,
+         ulid: Float = 0, uin: Float = 0, rampSteps: Int = 0,
+         force: SIMD3<Float> = .zero, wantsForces: Bool = false,
          flags: (Int, Int, Int) -> Cell) throws {
         self.gpu = gpu
         self.precision = precision
@@ -152,6 +164,7 @@ final class Simulation {
         self.omega = omega
         self.omegaMinus = omegaMinus ?? omega
         self.ulidTarget = ulid
+        self.uinTarget = uin
         self.rampSteps = rampSteps
         self.force = force
         let n = nx * ny * nz
@@ -160,26 +173,31 @@ final class Simulation {
               let fl = gpu.device.makeBuffer(length: n, options: .storageModeShared),
               let sm = gpu.device.makeBuffer(length: n * 4, options: .storageModeShared),
               let lm = gpu.device.makeBuffer(length: n * 4, options: .storageModeShared),
-              let mo = gpu.device.makeBuffer(length: n * 16, options: .storageModeShared) else {
+              let mo = gpu.device.makeBuffer(length: n * 16, options: .storageModeShared),
+              let fo = gpu.device.makeBuffer(length: wantsForces ? n * 16 : 16, options: .storageModeShared) else {
             throw KarmanError.message("buffer allocation failed")
         }
-        fBuf = f; flagBuf = fl; solidMaskBuf = sm; lidMaskBuf = lm; momentsBuf = mo
+        fBuf = f; flagBuf = fl; solidMaskBuf = sm; lidMaskBuf = lm; momentsBuf = mo; forceBuf = fo
         memset(fBuf.contents(), 0, fBuf.length) // shifted equilibrium at rest is exactly 0
 
         // Flags and per-cell neighbor masks (bit i-1: neighbor at n + c_i).
         let flagPtr = flagBuf.contents().bindMemory(to: UInt8.self, capacity: n)
         var cellFlags = [Cell](repeating: .fluid, count: n)
+        var sawOutflow = false
         for z in 0..<nz { for y in 0..<ny { for x in 0..<nx {
             let c = flags(x, y, z)
             cellFlags[(z * ny + y) * nx + x] = c
-            flagPtr[(z * ny + y) * nx + x] = c == .fluid ? 0 : 1
+            flagPtr[(z * ny + y) * nx + x] = c.rawValue
+            if c == .outflow { sawOutflow = true }
         }}}
+        self.hasOutflow = sawOutflow
         let sPtr = solidMaskBuf.contents().bindMemory(to: UInt32.self, capacity: n)
         let lPtr = lidMaskBuf.contents().bindMemory(to: UInt32.self, capacity: n)
         for z in 0..<nz { for y in 0..<ny { for x in 0..<nx {
             let idx = (z * ny + y) * nx + x
             var sMask: UInt32 = 0, lMask: UInt32 = 0
-            if cellFlags[idx] == .fluid {
+            let c = cellFlags[idx]
+            if c == .fluid {
                 for i in 1..<19 {
                     let xn = (x + Self.cx[i] + nx) % nx
                     let yn = (y + Self.cy[i] + ny) % ny
@@ -187,7 +205,8 @@ final class Simulation {
                     switch cellFlags[(zn * ny + yn) * nx + xn] {
                     case .fluid: break
                     case .solid: sMask |= 1 << UInt32(i - 1)
-                    case .lid: sMask |= 1 << UInt32(i - 1); lMask |= 1 << UInt32(i - 1)
+                    case .lid, .inflow, .outflow:
+                        sMask |= 1 << UInt32(i - 1); lMask |= 1 << UInt32(i - 1)
                     }
                 }
             }
@@ -195,16 +214,21 @@ final class Simulation {
         }}}
     }
 
-    private func currentLid(atStep t: Int) -> Float {
-        guard rampSteps > 0 else { return ulidTarget }
-        return ulidTarget * Float(min(1.0, Double(t) / Double(rampSteps)))
+    private func ramp(_ target: Float, atStep t: Int) -> Float {
+        guard rampSteps > 0 else { return target }
+        return target * Float(min(1.0, Double(t) / Double(rampSteps)))
     }
 
-    private func params(step t: Int) -> Params {
+    private func params(step t: Int, writeForce: Bool = false) -> Params {
         Params(nx: UInt32(nx), ny: UInt32(ny), nz: UInt32(nz),
                parity: UInt32(t & 1), omega: omega, omegaMinus: omegaMinus,
-               ulid: currentLid(atStep: t), fx: force.x, fy: force.y, fz: force.z)
+               ulid: ramp(ulidTarget, atStep: t), uin: ramp(uinTarget, atStep: t),
+               fx: force.x, fy: force.y, fz: force.z,
+               outBlend: outBlend, writeForce: writeForce ? 1 : 0, rhoIn: rhoIn)
     }
+
+    /// Steps (absolute indices) whose odd pass should accumulate forces.
+    private var forceSteps: Set<Int> = []
 
     /// Run `count` steps. Chunked into command buffers small enough to stay
     /// under the GPU watchdog; up to two buffers in flight.
@@ -222,13 +246,15 @@ final class Simulation {
                   let enc = cb.makeComputeCommandEncoder() else {
                 throw KarmanError.message("command buffer creation failed")
             }
-            enc.setComputePipelineState(pipes.step)
             enc.setBuffer(fBuf, offset: 0, index: 0)
             enc.setBuffer(flagBuf, offset: 0, index: 1)
             enc.setBuffer(solidMaskBuf, offset: 0, index: 2)
             enc.setBuffer(lidMaskBuf, offset: 0, index: 3)
+            enc.setBuffer(forceBuf, offset: 0, index: 5)
             for s in 0..<batch {
-                var p = params(step: stepsDone + s)
+                var p = params(step: stepsDone + s,
+                               writeForce: forceSteps.contains(stepsDone + s))
+                enc.setComputePipelineState(pipes.step)
                 enc.setBytes(&p, length: MemoryLayout<Params>.stride, index: 4)
                 enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                                     threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -270,6 +296,25 @@ final class Simulation {
         cb.waitUntilCompleted()
         let ptr = momentsBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: cells)
         return UnsafeBufferPointer(start: ptr, count: cells)
+    }
+
+    /// Momentum-exchange force probe: runs one even+odd step pair with force
+    /// accumulation on the odd pass, then sums per-cell contributions on the
+    /// CPU (double, fixed order — deterministic) over cells inside the given
+    /// bounding box. Requires wantsForces at init and an even step count.
+    func probeForce(xRange: ClosedRange<Int>, yRange: ClosedRange<Int>) throws -> SIMD3<Double> {
+        precondition(stepsDone % 2 == 0, "force probe requires even step count")
+        memset(forceBuf.contents(), 0, forceBuf.length)
+        forceSteps = [stepsDone + 1]
+        try run(steps: 2)
+        forceSteps = []
+        let ptr = forceBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: cells)
+        var total = SIMD3<Double>.zero
+        for y in yRange { for x in xRange {
+            let v = ptr[y * nx + x]
+            total += SIMD3(Double(v.x), Double(v.y), Double(v.z))
+        }}
+        return total
     }
 
     /// mode 1 = Taylor-Green (2D, one period per box), amplitude in lattice units.

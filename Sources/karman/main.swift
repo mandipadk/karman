@@ -40,6 +40,13 @@ func main() throws {
     case "determinism":
         results = [try runDeterminism(gpu: gpu, precision: .fp32),
                    try runDeterminism(gpu: gpu, precision: .fp16s)]
+    case "channel":
+        results = [try runChannelTest(gpu: gpu)]
+    case "dfg":
+        let d = args.dropFirst().first.flatMap { Int($0) } ?? 40
+        let u = args.dropFirst(2).first.flatMap { Float($0) } ?? 0.075
+        let up = args.dropFirst(3).first.flatMap { Double($0) } ?? 2.0
+        results = [try runDFG1(gpu: gpu, D: d, uinMax: u, upstreamD: up)]
     case "poiseuille":
         results = [try runPoiseuille(gpu: gpu)]
     case "tgorder":
@@ -67,6 +74,10 @@ func main() throws {
         print("— Taylor-Green order —")
         let tg = try runTaylorGreenOrder(gpu: gpu)
         printResult(tg); results.append(tg)
+
+        print("— Schäfer–Turek 2D-1 —")
+        let dfg = try runDFG1(gpu: gpu, D: 40)
+        printResult(dfg); results.append(dfg)
 
         print("— cavity Re=1000: fp32+TRT, fp16s+SRT —")
         // FP16S pairs with SRT: TRT's antisymmetric mode is a difference of

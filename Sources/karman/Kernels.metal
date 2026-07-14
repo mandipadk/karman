@@ -49,17 +49,36 @@ constant float W[19] = {
 constant int OPP[19] = {0, 2,1, 4,3, 6,5, 8,7, 10,9, 12,11, 14,13, 16,15, 18,17};
 
 struct Params {
-    uint  nx, ny, nz;
-    uint  parity;      // 0 = even step, 1 = odd step
+    uint  nx, ny, nz, parity;   // parity: 0 = even step, 1 = odd step
     float omega;       // omega+ (1/tau; 0 disables collision exactly)
     float omegaMinus;  // omega- (== omega for SRT)
     float ulid;        // current (ramped) lid velocity, +x
-    float fx;          // uniform body force density (lattice units)
-    float fy, fz;
-    uint  pad0, pad1;
+    float uin;         // current (ramped) inflow peak velocity, +x
+    float fx, fy, fz;  // uniform body force density (lattice units)
+    float outBlend;    // outflow blend factor (1 = pure zero-gradient copy)
+    uint  writeForce;  // odd steps: accumulate momentum-exchange per cell
+    float rhoIn;       // inlet density (mass-flux controller state)
+    uint  pad1, pad2;
 };
 
-constant uchar FLAG_FLUID = 0;
+constant uchar FLAG_FLUID   = 0;
+constant uchar FLAG_SOLID   = 1;
+constant uchar FLAG_LID     = 2;
+constant uchar FLAG_INFLOW  = 3;  // bounce-back wall with parabolic normal velocity
+constant uchar FLAG_OUTFLOW = 4;  // anti-bounce-back pressure wall: with shifted
+                                  // DDFs at rho_target = 1, fs_in = -fs_out
+                                  // (Ginzburg ABB, u-terms dropped: O(u^2) local)
+
+// Moving-wall x-velocity for a boundary link into cell (wx, wy): lid walls
+// carry the global lid speed; inflow walls the parabolic profile at wy.
+// A bounce-back wall with a NORMAL velocity component injects mass flux
+// rho_w * u_w exactly (the standard flux-exact velocity inlet).
+inline float wallVelX(uchar wallFlag, int wy, constant Params& p) {
+    if (wallFlag == FLAG_LID) { return p.ulid; }
+    const float H  = (float)p.ny - 2.0f;
+    const float yd = (float)wy - 0.5f;
+    return max(4.0f * p.uin * yd * (H - yd) / (H * H), 0.0f);
+}
 
 inline uint fidx(uint i, uint n, uint N) { return i * N + n; }
 
@@ -122,10 +141,13 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                  device const uint*  solidMask [[buffer(2)]],  // bit i-1: neighbor n + c_i is solid
                  device const uint*  lidMask   [[buffer(3)]],  // subset of solidMask that is lid
                  constant Params&    p         [[buffer(4)]],
+                 device float4*      force     [[buffer(5)]],  // per-cell momentum exchange (writeForce)
                  uint n [[thread_position_in_grid]])
 {
     const uint N = p.nx * p.ny * p.nz;
-    if (n >= N || flags[n] != FLAG_FLUID) { return; }
+    if (n >= N) { return; }
+    const uchar flag = flags[n];
+    if (flag != FLAG_FLUID) { return; }
 
     const int x = (int)(n % p.nx);
     const int t = (int)(n / p.nx);
@@ -142,16 +164,36 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
         for (int i = 1; i < 19; i++) { f[fidx(OPP[i], n, N)] = (FPXX)fh[i]; }
     } else {
         // -------- odd: streaming pass (neighbors + bounce-back) --------
+        // Momentum exchange (Mei/Ladd): net momentum flux fluid->wall across
+        // a link with toward-wall direction j during one step is
+        // c_j (f_j^out + f_i^in), i = opp(j), in RAW DDFs. Shifted DDFs add
+        // the constant 2 w_j c_j per link (static pressure; sums to zero over
+        // closed bodies). The load side handles f_i^in (with -c_i = c_j), the
+        // store side f_j^out + 2 w_j.
         const uint sMask = solidMask[n];
         const uint lMask = lidMask[n];
+        float ax = 0.0f, ay = 0.0f, az = 0.0f;
         fh[0] = (float)f[fidx(0, n, N)];
         for (int i = 1; i < 19; i++) {
             // incoming along i from source s = n - c_i (neighbor in dir opp(i))
             const int srcBit = OPP[i] - 1;
             if ((sMask >> srcBit) & 1u) {
-                float corr = ((lMask >> srcBit) & 1u)
-                    ? 6.0f * W[i] * ((float)Cx[i] * p.ulid) : 0.0f;
-                fh[i] = (float)f[fidx(i, n, N)] + corr;
+                float corr = 0.0f;
+                float sign = 1.0f;
+                if ((lMask >> srcBit) & 1u) {
+                    const int sy = wrap(y - Cy[i], (int)p.ny);
+                    const uint s = ((uint)wrap(z - Cz[i], (int)p.nz) * p.ny + (uint)sy) * p.nx
+                                 + (uint)wrap(x - Cx[i], (int)p.nx);
+                    const uchar wf = flags[s];
+                    if (wf == FLAG_OUTFLOW) { sign = -1.0f; }
+                    else { corr = 6.0f * W[i] * ((float)Cx[i] * wallVelX(wf, sy, p)); }
+                }
+                fh[i] = sign * (float)f[fidx(i, n, N)] + corr;
+                if (p.writeForce != 0u) {
+                    ax -= (float)Cx[i] * fh[i];
+                    ay -= (float)Cy[i] * fh[i];
+                    az -= (float)Cz[i] * fh[i];
+                }
             } else {
                 const int sx = wrap(x - Cx[i], (int)p.nx);
                 const int sy = wrap(y - Cy[i], (int)p.ny);
@@ -165,9 +207,23 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
         for (int i = 1; i < 19; i++) {
             const int dstBit = i - 1;
             if ((sMask >> dstBit) & 1u) {
-                float corr = ((lMask >> dstBit) & 1u)
-                    ? 6.0f * W[i] * ((float)Cx[i] * p.ulid) : 0.0f;
-                f[fidx(OPP[i], n, N)] = (FPXX)(fh[i] - corr);
+                float corr = 0.0f;
+                float sign = 1.0f;
+                if ((lMask >> dstBit) & 1u) {
+                    const int dy = wrap(y + Cy[i], (int)p.ny);
+                    const uint d = ((uint)wrap(z + Cz[i], (int)p.nz) * p.ny + (uint)dy) * p.nx
+                                 + (uint)wrap(x + Cx[i], (int)p.nx);
+                    const uchar wf = flags[d];
+                    if (wf == FLAG_OUTFLOW) { sign = -1.0f; }
+                    else { corr = 6.0f * W[i] * ((float)Cx[i] * wallVelX(wf, dy, p)); }
+                }
+                f[fidx(OPP[i], n, N)] = (FPXX)(sign * fh[i] - corr);
+                if (p.writeForce != 0u) {
+                    const float v = fh[i] + 2.0f * W[i];
+                    ax += (float)Cx[i] * v;
+                    ay += (float)Cy[i] * v;
+                    az += (float)Cz[i] * v;
+                }
             } else {
                 const int dx = wrap(x + Cx[i], (int)p.nx);
                 const int dy = wrap(y + Cy[i], (int)p.ny);
@@ -175,6 +231,64 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                 const uint d = ((uint)dz * p.ny + (uint)dy) * p.nx + (uint)dx;
                 f[fidx(i, d, N)] = (FPXX)fh[i];
             }
+        }
+        if (p.writeForce != 0u && sMask != 0u) {
+            force[n] = float4(ax, ay, az, 0.0f);
+        }
+    }
+}
+
+// Pressure outlet: after each step, outflow cells become shifted equilibrium
+// at rho = 1 with the -x neighbor's velocity (velocity zero-gradient,
+// pressure Dirichlet). A raw DDF copy does NOT conserve mass — the channel
+// back-pressures until a soft equilibrium inlet yields several percent of
+// flux (measured: -4.8%). Anchoring rho at the outlet lets the inlet flux
+// through. Slot-verbatim equilibrium write is parity-safe. Runs as a
+// separate dispatch after the step kernel (reads neighbor post-step state).
+kernel void outflowCopy(device FPXX*        f     [[buffer(0)]],
+                        device const uchar* flags [[buffer(1)]],
+                        constant Params&    p     [[buffer(6)]],  // 2-5 belong to `step` — do not clobber
+                        uint n [[thread_position_in_grid]])
+{
+    const uint N = p.nx * p.ny * p.nz;
+    if (n >= N || flags[n] != FLAG_OUTFLOW) { return; }
+    const uint src = n - 1; // -x neighbor
+    // Parity-aware READ: after an even step f_i sits at slot opp(i); a
+    // verbatim read there negates the momentum sum (imposing a backward
+    // outlet velocity every other step).
+    float rhom1 = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
+    for (int i = 0; i < 19; i++) {
+        const uint slot = (p.parity == 1u) ? (uint)i : (uint)OPP[i];
+        const float v = (float)f[fidx(slot, src, N)];
+        rhom1 += v;
+        px += (float)Cx[i] * v;
+        py += (float)Cy[i] * v;
+        pz += (float)Cz[i] * v;
+    }
+    const float inv = 1.0f / (1.0f + rhom1);
+    const float ux = px * inv, uy = py * inv, uz = pz * inv;
+    const float u2 = ux*ux + uy*uy + uz*uz;
+    // Parity-aware store: after an odd step the state sits in natural slots;
+    // after an even step, in swapped slots (f_i lives at opp(i)).
+    const int x = (int)(n % p.nx);
+    const int t = (int)(n / p.nx);
+    const int y = t % (int)p.ny;
+    const int z = t / (int)p.ny;
+    for (int i = 0; i < 19; i++) {
+        const float cu = 3.0f * ((float)Cx[i]*ux + (float)Cy[i]*uy + (float)Cz[i]*uz);
+        const float v = W[i] * (cu + 0.5f*cu*cu - 1.5f*u2); // rho = 1
+        const uint slot = (p.parity == 1u) ? (uint)i : (uint)OPP[i];
+        f[fidx(slot, n, N)] = (FPXX)v;
+        // The outflow never scatters during the pass (mid-pass writes race
+        // with its neighbor's). After odd steps, deliver here what an active
+        // cell's odd-store would have left in the neighbors' natural slots:
+        // the -x-family DDFs their next EVEN load reads.
+        if (p.parity == 1u && Cx[i] < 0) {
+            const int dx = wrap(x + Cx[i], (int)p.nx);
+            const int dy = wrap(y + Cy[i], (int)p.ny);
+            const int dz = wrap(z + Cz[i], (int)p.nz);
+            const uint d = ((uint)dz * p.ny + (uint)dy) * p.nx + (uint)dx;
+            if (flags[d] == FLAG_FLUID) { f[fidx(i, d, N)] = (FPXX)v; }
         }
     }
 }
@@ -190,7 +304,8 @@ kernel void momentsEven(device const FPXX*  f     [[buffer(0)]],
 {
     const uint N = p.nx * p.ny * p.nz;
     if (n >= N) { return; }
-    if (flags[n] != FLAG_FLUID) { out[n] = float4(0.0f); return; }
+    const uchar flag = flags[n];
+    if (flag != FLAG_FLUID && flag != FLAG_OUTFLOW) { out[n] = float4(0.0f); return; }
     float rhom1 = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
     for (int i = 0; i < 19; i++) {
         const float v = (float)f[fidx(i, n, N)];

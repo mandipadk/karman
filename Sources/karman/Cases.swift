@@ -395,3 +395,130 @@ func runDeterminism(gpu: GPU, precision: Precision = .fp32) throws -> GateResult
                         ? "cavity 128² ×10k steps and 128³ TG ×100 steps: digests identical (\(a.prefix(16))…)"
                         : "DIGEST MISMATCH — cavity: \(a.prefix(16)) vs \(b.prefix(16)); bench: \(c.prefix(16)) vs \(d.prefix(16))")
 }
+
+// MARK: - Channel isolation test (inlet/outlet pair, no cylinder)
+
+/// Straight channel with the bounce-back velocity inlet and pressure outlet:
+/// flux must equal nominal and the profile must be the parabola. Isolates
+/// the open-boundary pair from any obstacle physics.
+func runChannelTest(gpu: GPU, D: Int = 40, uinMax: Float = 0.075) throws -> GateResult {
+    let nx = 10 * D + 2
+    let ny = Int(4.1 * Double(D)) + 2
+    let uMean = Double(uinMax) * 2.0 / 3.0
+    let nu = uMean * Double(D) / 20.0
+    let (wp, wm) = Simulation.trtOmegas(tau: 3.0 * nu + 0.5, lambda: 3.0 / 16.0)
+    let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: 1,
+                             omega: wp, omegaMinus: wm,
+                             uin: uinMax, rampSteps: 4000) { x, y, _ in
+        if y == 0 || y == ny - 1 { return .solid }
+        if x == 0 || x == nx - 1 { return .inflow } // velocity walls both ends: exact mass closure
+        return .fluid
+    }
+    try sim.run(steps: 60_000)
+    let m = try sim.probeMoments()
+    func stats(atCol x: Int) -> (flux: Double, rho: Double) {
+        var flux = 0.0, rho = 0.0
+        for y in 1...(ny - 2) {
+            flux += Double(m[y * sim.nx + x].x)
+            rho += Double(m[y * sim.nx + x].w)
+        }
+        return (flux, rho / Double(ny - 2))
+    }
+    let nominal = Double(uinMax) * 2.0 / 3.0 * Double(ny - 2)
+    let a = stats(atCol: 1), b = stats(atCol: nx / 2), c = stats(atCol: nx - 3)
+    let err = abs(a.flux / nominal - 1)
+    return GateResult(name: "channel isolation (D=\(D))",
+                      passed: err < 0.005,
+                      detail: String(format: "flux/nominal: col1 %.4f, mid %.4f, exit %.4f; rho: %.5f / %.5f / %.5f",
+                                     a.flux / nominal, b.flux / nominal, c.flux / nominal,
+                                     a.rho, b.rho, c.rho))
+}
+
+// MARK: - Schäfer–Turek DFG 2D-1 (steady cylinder drag)
+
+/// DFG benchmark "flow around a cylinder" 2D-1 (Schäfer & Turek 1996):
+/// channel 2.2×0.41 m, cylinder d=0.1 m at (0.2, 0.2), parabolic inflow,
+/// Re=20 steady. Spectral reference (Nabh 1998, featflow.de):
+/// C_D = 5.57953523384, C_L = 0.010618948146, Δp = 0.11752016697.
+/// Resolution D = cells per cylinder diameter.
+func runDFG1(gpu: GPU, D: Int = 40, maxSteps: Int = 240_000,
+             uinMax: Float = 0.075, upstreamD: Double = 2.0) throws -> GateResult {
+    let nx = Int((20.0 + upstreamD) * Double(D)) + 2 // inflow col 0, outflow col nx-1
+    let ny = Int(4.1 * Double(D)) + 2 // walls y=0, ny-1
+    let uMean = Double(uinMax) * 2.0 / 3.0
+    let re = 20.0
+    let nu = uMean * Double(D) / re
+    let tau = 3.0 * nu + 0.5
+    let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: 3.0 / 16.0)
+    // Cylinder center 0.2 m = 2D cells from the inlet plane (x = 0.5) and
+    // the bottom wall plane (y = 0.5); radius D/2 in cells.
+    let cx = 0.5 + upstreamD * Double(D)
+    let cy = 0.5 + 2.0 * Double(D)
+    let r2 = Double(D * D) / 4.0
+
+    let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: 1,
+                             omega: wp, omegaMinus: wm,
+                             uin: uinMax, rampSteps: 4000, wantsForces: true) { x, y, _ in
+        if y == 0 || y == ny - 1 { return .solid }
+        let dx = Double(x) - cx, dy = Double(y) - cy
+        if dx * dx + dy * dy <= r2 { return .solid }
+        if x == 0 || x == nx - 1 { return .inflow } // velocity walls both ends
+        return .fluid
+    }
+
+    // Probe drag every few thousand steps until it stops changing.
+    let boxX = (Int(cx) - D / 2 - 3)...(Int(cx) + D / 2 + 3)
+    let boxY = (Int(cy) - D / 2 - 3)...(Int(cy) + D / 2 + 3)
+    var cd = 0.0, cl = 0.0
+    var prevCd = Double.infinity
+    var settled = 0
+    let flowThrough = Int(Double(nx) / uMean)
+    while sim.stepsDone < maxSteps {
+        try sim.run(steps: 4000 - 2) // probe advances 2 more
+        let f = try sim.probeForce(xRange: boxX, yRange: boxY)
+        cd = 2.0 * f.x / (uMean * uMean * Double(D))
+        cl = 2.0 * f.y / (uMean * uMean * Double(D))
+        if sim.stepsDone > 3 * flowThrough {
+            if abs(cd - prevCd) / abs(cd) < 1e-5 { settled += 1 } else { settled = 0 }
+            if settled >= 3 { break }
+        }
+        prevCd = cd
+    }
+
+    // Pressure difference across the cylinder, reported (not gated). The
+    // reference points (0.15/0.25, 0.2) are ON the surface (stagnation
+    // points); the staircase has no fluid there, so we sample the nearest
+    // fluid cells one cell off the surface. Δp* = Δp_lat/(rho u_mean²);
+    // reference 0.11752/0.2² = 2.938.
+    let m = try sim.probeMoments()
+    func rho(atCol x: Int) -> Double {
+        let y0 = Int(cy - 0.5)
+        return (Double(m[y0 * sim.nx + x].w) + Double(m[(y0 + 1) * sim.nx + x].w)) / 2.0
+    }
+    let front = Int(cx - 0.5) - D / 2 - 1, back = Int(cx - 0.5) + D / 2 + 2 // one cell off surface
+    let dpStar = (rho(atCol: front) - rho(atCol: back)) / 3.0 / (uMean * uMean)
+
+    // Diagnostic: what does the inflow parabola look like by the time it
+    // reaches the cylinder? Compare mass flux and peak velocity at the first
+    // interior column vs one diameter upstream of the center.
+    func fluxAndPeak(atCol x: Int) -> (Double, Double) {
+        var flux = 0.0, peak = 0.0
+        for y in 1...(ny - 2) {
+            let v = Double(m[y * sim.nx + x].x)
+            flux += v; peak = max(peak, v)
+        }
+        return (flux, peak)
+    }
+    let nominalFlux = Double(uinMax) * 2.0 / 3.0 * Double(ny - 2)
+    let (fluxIn, peakIn) = fluxAndPeak(atCol: 1)
+    let (fluxCyl, peakCyl) = fluxAndPeak(atCol: Int(cx) - D)
+
+    let cdRef = 5.57953523384
+    let cdErr = abs(cd - cdRef) / cdRef
+    let passed = cdErr <= 0.01
+    return GateResult(name: String(format: "Schäfer–Turek 2D-1 Re=20 (D=%d, u=%.3f, up=%.0fD)", D, uinMax, upstreamD),
+                      passed: passed,
+                      detail: String(format: "C_D %.4f vs 5.5795 (err %.2f%%, gate ≤1%%); C_L %+.4f (ref +0.0106); Δp* %.3f (ref 2.938); %d steps", cd, cdErr * 100, cl, dpStar, sim.stepsDone)
+                        + String(format: "\n  flux: nominal %.4f, col1 %.4f (%+.2f%%), 1D-up %.4f (%+.2f%%); peak: nominal %.4f, col1 %.4f, 1D-up %.4f",
+                                 nominalFlux, fluxIn, (fluxIn/nominalFlux - 1)*100, fluxCyl, (fluxCyl/nominalFlux - 1)*100, Double(uinMax), peakIn, peakCyl))
+}
