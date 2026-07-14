@@ -1,5 +1,10 @@
 .DS_Store
+.build/
 build/
 DerivedData/
 *.xcuserstate
 .swiftpm/
+# internal working documents — never committed or pushed
+PLAN.md
+docs/
+reports/

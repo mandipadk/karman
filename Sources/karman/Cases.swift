@@ -2,8 +2,10 @@ import Foundation
 
 // MARK: - Ghia, Ghia & Shin (1982) oracle — interior points only (boundary
 // rows are identically satisfied by the BCs). Columns: coordinate, Re=100,
-// Re=400, Re=1000. See docs/research/benchmarks-and-uq.md for provenance
-// and known transcription caveats.
+// Re=400, Re=1000. Source: J. Comput. Phys. 48, 387-411 (1982), Tables I/II.
+// Caveat: widely-mirrored ASCII copies of these tables carry transcription
+// slips (e.g. the Re=400 v value at x=0.9063 is long-suspected) — verify
+// against a scan of the paper before extending to other Re.
 
 let ghiaU: [(y: Double, re100: Double, re400: Double, re1000: Double)] = [
     (0.9766,  0.84123,  0.75837,  0.65928),
