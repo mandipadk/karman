@@ -11,13 +11,12 @@ struct Params {
     var nx: UInt32, ny: UInt32, nz: UInt32, parity: UInt32
     var omega: Float
     var omegaMinus: Float
-    var ulid: Float
     var uin: Float
+    var cSmago: Float
     var fx: Float, fy: Float, fz: Float
-    var outBlend: Float
     var writeForce: UInt32
-    var rhoIn: Float = 1.0
-    var pad1: UInt32 = 0, pad2: UInt32 = 0
+    var ulidX: Float, ulidY: Float, ulidZ: Float
+    var pad0: UInt32 = 0
 }
 
 struct InitParams {
@@ -39,7 +38,6 @@ struct Pipelines {
     let step: MTLComputePipelineState
     let moments: MTLComputePipelineState
     let initField: MTLComputePipelineState
-    let outflowCopy: MTLComputePipelineState
 }
 
 final class GPU {
@@ -79,8 +77,7 @@ final class GPU {
         }
         let p = Pipelines(step: try pipeline("step"),
                           moments: try pipeline("momentsEven"),
-                          initField: try pipeline("initField"),
-                          outflowCopy: try pipeline("outflowCopy"))
+                          initField: try pipeline("initField"))
         pipelines[precision] = p
         return p
     }
@@ -125,13 +122,11 @@ final class Simulation {
     let momentsBuf: MTLBuffer
     var omega: Float
     var omegaMinus: Float
-    var ulidTarget: Float
+    var lidVel: SIMD3<Float>
     var uinTarget: Float
     var rampSteps: Int
     var force: SIMD3<Float>
-    var outBlend: Float = 1.0
-    var rhoIn: Float = 1.0
-    let hasOutflow: Bool
+    var cSmago: Float
     let forceBuf: MTLBuffer
     private(set) var stepsDone: Int = 0
     private let runState = RunState()
@@ -154,8 +149,9 @@ final class Simulation {
 
     init(gpu: GPU, precision: Precision = .fp32, nx: Int, ny: Int, nz: Int,
          omega: Float, omegaMinus: Float? = nil,
-         ulid: Float = 0, uin: Float = 0, rampSteps: Int = 0,
-         force: SIMD3<Float> = .zero, wantsForces: Bool = false,
+         lid: SIMD3<Float> = .zero, uin: Float = 0, rampSteps: Int = 0,
+         force: SIMD3<Float> = .zero, cSmago: Float = 0,
+         wantsForces: Bool = false,
          flags: (Int, Int, Int) -> Cell) throws {
         self.gpu = gpu
         self.precision = precision
@@ -163,10 +159,11 @@ final class Simulation {
         self.nx = nx; self.ny = ny; self.nz = nz
         self.omega = omega
         self.omegaMinus = omegaMinus ?? omega
-        self.ulidTarget = ulid
+        self.lidVel = lid
         self.uinTarget = uin
         self.rampSteps = rampSteps
         self.force = force
+        self.cSmago = cSmago
         let n = nx * ny * nz
 
         guard let f = gpu.device.makeBuffer(length: 19 * n * precision.ddfBytes, options: .storageModeShared),
@@ -183,14 +180,11 @@ final class Simulation {
         // Flags and per-cell neighbor masks (bit i-1: neighbor at n + c_i).
         let flagPtr = flagBuf.contents().bindMemory(to: UInt8.self, capacity: n)
         var cellFlags = [Cell](repeating: .fluid, count: n)
-        var sawOutflow = false
         for z in 0..<nz { for y in 0..<ny { for x in 0..<nx {
             let c = flags(x, y, z)
             cellFlags[(z * ny + y) * nx + x] = c
             flagPtr[(z * ny + y) * nx + x] = c.rawValue
-            if c == .outflow { sawOutflow = true }
         }}}
-        self.hasOutflow = sawOutflow
         let sPtr = solidMaskBuf.contents().bindMemory(to: UInt32.self, capacity: n)
         let lPtr = lidMaskBuf.contents().bindMemory(to: UInt32.self, capacity: n)
         for z in 0..<nz { for y in 0..<ny { for x in 0..<nx {
@@ -220,11 +214,13 @@ final class Simulation {
     }
 
     private func params(step t: Int, writeForce: Bool = false) -> Params {
-        Params(nx: UInt32(nx), ny: UInt32(ny), nz: UInt32(nz),
-               parity: UInt32(t & 1), omega: omega, omegaMinus: omegaMinus,
-               ulid: ramp(ulidTarget, atStep: t), uin: ramp(uinTarget, atStep: t),
-               fx: force.x, fy: force.y, fz: force.z,
-               outBlend: outBlend, writeForce: writeForce ? 1 : 0, rhoIn: rhoIn)
+        let r = ramp(1.0, atStep: t)
+        return Params(nx: UInt32(nx), ny: UInt32(ny), nz: UInt32(nz),
+                      parity: UInt32(t & 1), omega: omega, omegaMinus: omegaMinus,
+                      uin: uinTarget * r, cSmago: cSmago,
+                      fx: force.x, fy: force.y, fz: force.z,
+                      writeForce: writeForce ? 1 : 0,
+                      ulidX: lidVel.x * r, ulidY: lidVel.y * r, ulidZ: lidVel.z * r)
     }
 
     /// Steps (absolute indices) whose odd pass should accumulate forces.

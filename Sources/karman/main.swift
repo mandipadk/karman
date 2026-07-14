@@ -40,6 +40,26 @@ func main() throws {
     case "determinism":
         results = [try runDeterminism(gpu: gpu, precision: .fp32),
                    try runDeterminism(gpu: gpu, precision: .fp16s)]
+    case "debugles":
+        try runDebugLES(gpu: gpu, re: 1e5, cSmago: 0.01, lambda: 0.25)
+        try runDebugLES(gpu: gpu, re: 1e5, cSmago: 0.04, lambda: 0.25)
+        try runDebugLES(gpu: gpu, re: 1e4, cSmago: 0.01, lambda: 0.25)
+        results = []
+    case "m1c":
+        print("— LES —")
+        for r in [try runLESStability(gpu: gpu), try runLESLaminarCost(gpu: gpu)] {
+            printResult(r); results.append(r)
+        }
+        print("— 3D —")
+        for r in [try runCavity3DPeriodicZ(gpu: gpu), try runCavityCubic(gpu: gpu)] {
+            printResult(r); results.append(r)
+        }
+        print("— symmetry / units / conservation —")
+        for r in [try runRotationTest(gpu: gpu), runUnitsTest(), try runMassDrift(gpu: gpu)] {
+            printResult(r); results.append(r)
+        }
+    case "debugchan":
+        results = [try runDebugChannel(gpu: gpu)]
     case "channel":
         results = [try runChannelTest(gpu: gpu)]
     case "dfg":
