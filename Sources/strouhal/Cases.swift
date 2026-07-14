@@ -1,5 +1,5 @@
 import Foundation
-import KarmanCore
+import StrouhalCore
 
 // MARK: - Ghia, Ghia & Shin (1982) oracle — interior points only (boundary
 // rows are identically satisfied by the BCs). Columns: coordinate, Re=100,
@@ -886,7 +886,7 @@ func dfg2(gpu: GPU, D: Int, transient: Int, sampleCycles: Int,
         t.append(Double(sim.stepsDone))
     }
 
-    if ProcessInfo.processInfo.environment["KARMAN_DEBUG"] != nil {
+    if ProcessInfo.processInfo.environment["STROUHAL_DEBUG"] != nil {
         // Spectral fingerprint: |DFT| of C_D at multiples of the shedding
         // frequency and at the duct acoustic fundamental.
         let meanCdAll = cd.reduce(0, +) / Double(cd.count)

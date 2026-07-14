@@ -1,7 +1,7 @@
 import Foundation
-import KarmanCore
+import StrouhalCore
 
-// karman CLI — M0 spike driver.
+// strouhal CLI — verification gate driver.
 //   karman selftest              parity/indexing proofs
 //   karman bench [n]             MLUPS benchmark (default 256)
 //   karman cavity [re] [n]       Ghia validation (default 1000, 256)
@@ -52,7 +52,7 @@ func main() throws {
         print("— 3D sphere wake (demo-case gate) —")
         let sph = try runSphere(gpu: gpu, D: 24, box: 96)
         printResult(sph); results.append(sph)
-        print("NOTE: app-side M3 gates are measured via KARMAN_APP_SECONDS autotests;")
+        print("NOTE: app-side M3 gates are measured via STROUHAL_APP_SECONDS autotests;")
         print("      latest: street 55 fps/5.5k steps/s; cavity 59 fps/15k steps/s,")
         print("      u_center matches Ghia live; sphere 192³ 33 fps/85 steps/s.")
     case "m2":

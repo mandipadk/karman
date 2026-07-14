@@ -9,15 +9,15 @@ public struct StlMesh {
     public var boundsMax: SIMD3<Float>
 
     public init(binarySTL data: Data) throws {
-        guard data.count >= 84 else { throw KarmanError.message("STL too short") }
+        guard data.count >= 84 else { throw StrouhalError.message("STL too short") }
         if let head = String(data: data.prefix(5), encoding: .ascii),
            head.lowercased() == "solid",
            data.count < 84 + 50 { // heuristic: real binary can also start with "solid"
-            throw KarmanError.message("ASCII STL not supported (binary only)")
+            throw StrouhalError.message("ASCII STL not supported (binary only)")
         }
         let count = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 80, as: UInt32.self) }
         guard data.count >= 84 + Int(count) * 50 else {
-            throw KarmanError.message("STL truncated (or ASCII; binary only)")
+            throw StrouhalError.message("STL truncated (or ASCII; binary only)")
         }
         var tris: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
         tris.reserveCapacity(Int(count))

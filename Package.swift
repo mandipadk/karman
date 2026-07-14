@@ -2,23 +2,23 @@
 import PackageDescription
 
 let package = Package(
-    name: "karman",
+    name: "strouhal",
     platforms: [.macOS(.v15)],
     targets: [
         .target(
-            name: "KarmanCore",
-            path: "Sources/KarmanCore",
+            name: "StrouhalCore",
+            path: "Sources/StrouhalCore",
             resources: [.copy("Kernels.metal")]
         ),
         .executableTarget(
-            name: "karman",
-            dependencies: ["KarmanCore"],
-            path: "Sources/karman"
+            name: "strouhal",
+            dependencies: ["StrouhalCore"],
+            path: "Sources/strouhal"
         ),
         .executableTarget(
-            name: "KarmanApp",
-            dependencies: ["KarmanCore"],
-            path: "Sources/KarmanApp"
+            name: "StrouhalApp",
+            dependencies: ["StrouhalCore"],
+            path: "Sources/StrouhalApp"
         )
     ]
 )

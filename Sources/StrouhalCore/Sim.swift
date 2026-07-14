@@ -67,12 +67,12 @@ public final class GPU {
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
-            throw KarmanError.noDevice
+            throw StrouhalError.noDevice
         }
         self.device = device
         self.queue = queue
         guard let url = Bundle.module.url(forResource: "Kernels", withExtension: "metal") else {
-            throw KarmanError.message("Kernels.metal resource missing")
+            throw StrouhalError.message("Kernels.metal resource missing")
         }
         self.source = try String(contentsOf: url, encoding: .utf8)
     }
@@ -90,7 +90,7 @@ public final class GPU {
         libraries[precision] = library
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
             guard let fn = library.makeFunction(name: name) else {
-                throw KarmanError.message("kernel \(name) not found")
+                throw StrouhalError.message("kernel \(name) not found")
             }
             return try device.makeComputePipelineState(function: fn)
         }
@@ -107,12 +107,12 @@ public final class GPU {
         throws -> (colorize: MTLComputePipelineState, quad: MTLRenderPipelineState) {
         _ = try pipelines(for: precision) // ensures the library is compiled
         guard let library = libraries[precision] else {
-            throw KarmanError.message("library missing")
+            throw StrouhalError.message("library missing")
         }
         guard let cfn = library.makeFunction(name: "colorize"),
               let vfn = library.makeFunction(name: "fsqVertex"),
               let ffn = library.makeFunction(name: "fsqFragment") else {
-            throw KarmanError.message("viz kernels not found")
+            throw StrouhalError.message("viz kernels not found")
         }
         let colorize = try device.makeComputePipelineState(function: cfn)
         let desc = MTLRenderPipelineDescriptor()
@@ -124,7 +124,7 @@ public final class GPU {
     }
 }
 
-public enum KarmanError: Error, CustomStringConvertible {
+public enum StrouhalError: Error, CustomStringConvertible {
     case noDevice
     case message(String)
     public var description: String {
@@ -218,7 +218,7 @@ public final class Simulation {
               let mo = gpu.device.makeBuffer(length: n * 16, options: .storageModeShared),
               let fo = gpu.device.makeBuffer(length: wantsForces ? n * 16 : 16, options: .storageModeShared),
               let ep = gpu.device.makeBuffer(length: 16, options: .storageModeShared) else {
-            throw KarmanError.message("buffer allocation failed")
+            throw StrouhalError.message("buffer allocation failed")
         }
         fBuf = f; flagBuf = fl; solidMaskBuf = sm; lidMaskBuf = lm; momentsBuf = mo; forceBuf = fo
         epsBuf = ep
@@ -297,7 +297,7 @@ public final class Simulation {
             inflight.wait()
             guard let cb = gpu.queue.makeCommandBuffer(),
                   let enc = cb.makeComputeCommandEncoder() else {
-                throw KarmanError.message("command buffer creation failed")
+                throw StrouhalError.message("command buffer creation failed")
             }
             enc.setBuffer(fBuf, offset: 0, index: 0)
             enc.setBuffer(flagBuf, offset: 0, index: 1)
@@ -326,7 +326,7 @@ public final class Simulation {
         inflight.wait(); inflight.wait()
         inflight.signal(); inflight.signal()
         if let code = runState.firstErrorCode {
-            throw KarmanError.message("GPU command buffer failed (code \(code)) — watchdog or recovery event")
+            throw StrouhalError.message("GPU command buffer failed (code \(code)) — watchdog or recovery event")
         }
     }
 
@@ -335,7 +335,7 @@ public final class Simulation {
         precondition(stepsDone % 2 == 0, "moments probe requires even step count")
         guard let cb = gpu.queue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else {
-            throw KarmanError.message("command buffer creation failed")
+            throw StrouhalError.message("command buffer creation failed")
         }
         enc.setComputePipelineState(pipes.moments)
         enc.setBuffer(fBuf, offset: 0, index: 0)
@@ -414,7 +414,7 @@ public final class Simulation {
         precondition(eps.count == cells)
         guard let buf = gpu.device.makeBuffer(bytes: eps, length: cells * 4,
                                               options: .storageModeShared) else {
-            throw KarmanError.message("eps buffer allocation failed")
+            throw StrouhalError.message("eps buffer allocation failed")
         }
         epsBuf = buf
         usesEps = true
@@ -424,7 +424,7 @@ public final class Simulation {
     public func initField(mode: UInt32, amplitude: Float) throws {
         guard let cb = gpu.queue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else {
-            throw KarmanError.message("command buffer creation failed")
+            throw StrouhalError.message("command buffer creation failed")
         }
         enc.setComputePipelineState(pipes.initField)
         enc.setBuffer(fBuf, offset: 0, index: 0)

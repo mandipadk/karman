@@ -5,8 +5,9 @@ verification-first: **every claim the solver makes is backed by a gate it
 must pass** — analytic exact solutions, published benchmark data, observed
 convergence order, and bitwise run-to-run determinism.
 
-Early days: this is the engine underneath a macOS fluid-dynamics instrument
-in development. CLI only for now.
+Named for the Strouhal number — the dimensionless shedding frequency of the
+Kármán vortex street, this project's first validated unsteady case and its
+live demo. A SwiftUI instrument app runs alongside the CLI gates.
 
 ## What works today
 

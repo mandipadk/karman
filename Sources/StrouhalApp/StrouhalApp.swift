@@ -1,20 +1,20 @@
 import SwiftUI
 import MetalKit
-import KarmanCore
+import StrouhalCore
 
 // The instrument, M3: case picker (vortex street / cavity / 3D sphere),
 // SI-units + envelope readout, live QoIs with a drag sparkline, |u| slice
 // visualization. Compute and render share one queue (two-queue at M4).
 
 @main
-struct KarmanApp: App {
+struct StrouhalApp: App {
     @StateObject private var controller = SimController()
     init() {
         NSApplication.shared.setActivationPolicy(.regular)
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
     var body: some Scene {
-        WindowGroup("karman (working title)") {
+        WindowGroup("Strouhal") {
             ContentView().environmentObject(controller)
         }
     }
@@ -171,9 +171,9 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         super.init()
         setupLine = active.setupLine
         envelopeLine = Self.envelopeText(active.envelope)
-        if let secs = ProcessInfo.processInfo.environment["KARMAN_APP_SECONDS"],
+        if let secs = ProcessInfo.processInfo.environment["STROUHAL_APP_SECONDS"],
            let t = Double(secs) {
-            if let c = ProcessInfo.processInfo.environment["KARMAN_APP_CASE"],
+            if let c = ProcessInfo.processInfo.environment["STROUHAL_APP_CASE"],
                let fc = FlowCase.allCases.first(where: { $0.rawValue.lowercased().contains(c) }) {
                 selectedCase = fc
                 reset()
