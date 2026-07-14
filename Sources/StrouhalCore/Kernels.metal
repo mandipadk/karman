@@ -411,13 +411,43 @@ kernel void initField(device FPXX*         f [[buffer(0)]],
         rhom1 = 0.75f * p.amplitude * p.amplitude
               * (cos(2.0f * kx * xa) + cos(2.0f * ky * ya)); // rho-1 = 3p
     }
+    float sxz = 0.0f, syz = 0.0f;   // extra strain components of the 3D TGV
+    if (p.mode == 2u) {
+        // 3D Taylor–Green vortex (HiOCFD workshop case BS1/WS1):
+        //   u =  A sin x' cos y' cos z',  v = -A cos x' sin y' cos z',  w = 0
+        //   p =  A²/16 (cos 2x' + cos 2y')(cos 2z' + 2)   →  rho-1 = 3p
+        // For this field S_xy = 0 and tr S = 0; the surviving strain
+        // components are S_xx = -S_yy and S_xz, S_yz from the z-modulation.
+        const uint x = n % p.nx;
+        const uint t = n / p.nx;
+        const uint y = t % p.ny;
+        const uint z = t / p.ny;
+        const float kx = 2.0f * M_PI_F / (float)p.nx;
+        const float ky = 2.0f * M_PI_F / (float)p.ny;
+        const float kz = 2.0f * M_PI_F / (float)p.nz;
+        const float xa = kx * ((float)x + 0.5f);
+        const float ya = ky * ((float)y + 0.5f);
+        const float za = kz * ((float)z + 0.5f);
+        ux =  p.amplitude * sin(xa) * cos(ya) * cos(za);
+        uy = -p.amplitude * cos(xa) * sin(ya) * cos(za);
+        sxx = p.amplitude * kx * cos(xa) * cos(ya) * cos(za);
+        sxz = -0.5f * p.amplitude * kz * sin(xa) * cos(ya) * sin(za);
+        syz =  0.5f * p.amplitude * kz * cos(xa) * sin(ya) * sin(za);
+        rhom1 = 0.1875f * p.amplitude * p.amplitude
+              * (cos(2.0f * xa) + cos(2.0f * ya)) * (cos(2.0f * za) + 2.0f);
+    }
     const float rho = 1.0f + rhom1;
     const float u2 = ux*ux + uy*uy + uz*uz;
     for (int i = 0; i < 19; i++) {
         const float cu = 3.0f * ((float)Cx[i]*ux + (float)Cy[i]*uy + (float)Cz[i]*uz);
         const float feq = W[i] * (rhom1 + rho * (cu + 0.5f*cu*cu - 1.5f*u2));
         const float cc = (float)(Cx[i]*Cx[i] - Cy[i]*Cy[i]);
-        const float fneq = -3.0f * W[i] * p.tau * sxx * cc; // S_xy = 0, tr S = 0 for symmetric TG
+        // fneq for a traceless S: -3 w τ Σ_ab S_ab c_a c_b (2D-validated form,
+        // extended with the 3D TGV's off-diagonal terms)
+        const float scc = sxx * cc
+                        + 2.0f * sxz * (float)(Cx[i]*Cz[i])
+                        + 2.0f * syz * (float)(Cy[i]*Cz[i]);
+        const float fneq = -3.0f * W[i] * p.tau * scc;
         f[fidx(i, n, N)] = (FPXX)(feq + fneq);
     }
 }

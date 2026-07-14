@@ -45,6 +45,15 @@ func main() throws {
         let ds = args.dropFirst().first.flatMap { Int($0) } ?? 24
         let bx = args.dropFirst(2).first.flatMap { Int($0) } ?? (ds * 4)
         results = [try runSphere(gpu: gpu, D: ds, box: bx)]
+    case "tgv":
+        let n = args.dropFirst().first.flatMap { Int($0) } ?? 128
+        let u0 = args.dropFirst(2).first.flatMap { Float($0) } ?? 0.1
+        let tEnd = args.dropFirst(3).first.flatMap { Double($0) } ?? 10.5
+        _ = try tgvRun(gpu: gpu, n: n, u0: u0, tEnd: tEnd) { print("      \($0)") }
+        results = []
+    case "m5":
+        print("— TGV Re=1600 vs DNS (the 3D turbulence anchor) —")
+        results = try runTGV1600(gpu: gpu)
     case "m4":
         print("— the credibility run (resolution ladder + Mach anchor) —")
         results = try runCredibility(gpu: gpu)
