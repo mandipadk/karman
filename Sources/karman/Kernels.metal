@@ -59,7 +59,7 @@ struct Params {
     float spongeX0;    // sponge zone start (lattice x); >= nx disables
     float spongeInvW;  // 1 / sponge width
     float spongeTau;   // target tau at the far end of the sponge
-    float pad1;
+    uint  useEps;      // partially-saturated (Noble-Torczynski) cells present
 };
 
 constant uchar FLAG_FLUID   = 0;
@@ -93,7 +93,16 @@ inline float3 wallVel(uchar wallFlag, int wy, constant Params& p) {
 // momentum flux (no stencils); tau_eff via the closed form
 // tau_eff = (tau0 + sqrt(tau0^2 + 18*sqrt(2)*Cs^2*|Pi|/rho))/2; the TRT magic
 // parameter Lambda is preserved when rescaling both rates.
-inline void collide(thread float* fh, constant Params& p, int x, thread float& rhoOut) {
+// Noble-Torczynski partially saturated cells (Noble & Torczynski 1998):
+// a boundary cell with solid fraction eps blends collision with a bounce
+// operator, B = eps(tau-1/2)/((1-eps)+(tau-1/2)):
+//   f_i <- f_i + (1-B)*Omega_TRT_i + B*(f_opp(i) - f_i)        [static walls]
+// Fully local (AA-safe by construction), second-order-ish for curved walls,
+// and the momentum exchange F = -sum_i c_i B (f_opp - f_i) = 2B sum_pairs
+// c_i (f_i - f_opp) is smooth in time — the staircase MEM's peak noise was
+// the measured blocker for the DFG 2D-2 peak gates.
+inline void collide(thread float* fh, constant Params& p, int x, float eps,
+                    thread float& rhoOut, thread float3& ntForce) {
     float wp = p.omega, wm = p.omegaMinus;
     // Viscous sponge (outlet damping): ramp tau toward spongeTau across the
     // zone so unsteady wakes arrive at the velocity-wall outlet near the
@@ -160,10 +169,17 @@ inline void collide(thread float* fh, constant Params& p, int x, thread float& r
     const float ap = 1.0f - 0.5f * wp;   // even-source prefactor
     const float am = 1.0f - 0.5f * wm;   // odd-source prefactor
 
-    { // rest direction: purely symmetric
+    float B = 0.0f;
+    if (eps > 0.0f) {
+        const float tw = 1.0f / wp - 0.5f;
+        B = eps * tw / ((1.0f - eps) + tw);
+    }
+    const float oneMinusB = 1.0f - B;
+
+    { // rest direction: purely symmetric (bounce term vanishes)
         const float feq0 = W[0] * (rhom1 - 1.5f * rho * u2);
         const float s0   = W[0] * ap * (-3.0f * uF);
-        fh[0] = fma(wp, feq0 - fh[0], fh[0]) + s0;
+        fh[0] += oneMinusB * (wp * (feq0 - fh[0]) + s0);
     }
     for (int i = 1; i < 19; i += 2) {
         const float cu = 3.0f * ((float)Cx[i]*ux + (float)Cy[i]*uy + (float)Cz[i]*uz);
@@ -177,8 +193,12 @@ inline void collide(thread float* fh, constant Params& p, int x, thread float& r
         // Guo source, TRT-split: odd part 3(c.F); even part 3 cu (c.F) - 3 u.F
         const float sm = W[i] * am * (3.0f * cF);
         const float sp = W[i] * ap * (3.0f * cu * cF - 3.0f * uF);
-        fh[i]   += dp + dm + sp + sm;
-        fh[i+1] += dp - dm + sp - sm;
+        const float bounce = B * (fh[i+1] - fh[i]); // static wall (u_w = 0)
+        fh[i]   += oneMinusB * (dp + dm + sp + sm) + bounce;
+        fh[i+1] += oneMinusB * (dp - dm + sp - sm) - bounce;
+        ntForce.x -= 2.0f * (float)Cx[i] * bounce;
+        ntForce.y -= 2.0f * (float)Cy[i] * bounce;
+        ntForce.z -= 2.0f * (float)Cz[i] * bounce;
     }
 }
 
@@ -188,10 +208,12 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                  device const uint*  lidMask   [[buffer(3)]],  // subset: moving-wall family / ABB
                  constant Params&    p         [[buffer(4)]],
                  device float4*      force     [[buffer(5)]],  // momentum exchange (writeForce)
+                 device const float* epsBuf    [[buffer(6)]],  // NT solid fraction (useEps)
                  uint n [[thread_position_in_grid]])
 {
     const uint N = p.nx * p.ny * p.nz;
     if (n >= N || flags[n] != FLAG_FLUID) { return; }
+    const float eps = (p.useEps != 0u) ? epsBuf[n] : 0.0f;
 
     const int x = (int)(n % p.nx);
     const int t = (int)(n / p.nx);
@@ -200,13 +222,17 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
 
     float fh[19];
     float rho = 1.0f;
+    float3 ntF = float3(0.0f);
 
     if (p.parity == 0u) {
         // -------- even: pure in-cell pass --------
         for (int i = 0; i < 19; i++) { fh[i] = (float)f[fidx(i, n, N)]; }
-        collide(fh, p, x, rho);
+        collide(fh, p, x, eps, rho, ntF);
         f[fidx(0, n, N)] = (FPXX)fh[0];
         for (int i = 1; i < 19; i++) { f[fidx(OPP[i], n, N)] = (FPXX)fh[i]; }
+        if (p.writeForce != 0u && eps > 0.0f) {
+            force[n] = float4(ntF, 0.0f);
+        }
     } else {
         // -------- odd: streaming pass (neighbors + walls) --------
         // Momentum exchange (Mei/Ladd): flux fluid->wall across a link with
@@ -261,7 +287,8 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                 }
             }
         }
-        collide(fh, p, x, rho);
+        collide(fh, p, x, eps, rho, ntF);
+        ax += ntF.x; ay += ntF.y; az += ntF.z;
         f[fidx(0, n, N)] = (FPXX)fh[0];
         for (int i = 1; i < 19; i++) {
             const int dstBit = i - 1;
@@ -296,7 +323,7 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                 f[fidx(i, d, N)] = (FPXX)fh[i];
             }
         }
-        if (p.writeForce != 0u && sMask != 0u) {
+        if (p.writeForce != 0u && (sMask != 0u || eps > 0.0f)) {
             force[n] = float4(ax, ay, az, 0.0f);
         }
     }

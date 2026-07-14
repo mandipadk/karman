@@ -20,7 +20,7 @@ struct Params {
     var spongeX0: Float = 1e9
     var spongeInvW: Float = 0
     var spongeTau: Float = 1.0
-    var pad1: Float = 0
+    var useEps: UInt32 = 0
 }
 
 struct InitParams {
@@ -133,6 +133,8 @@ final class Simulation {
     var cSmago: Float
     var sponge: (x0: Float, width: Float, tau: Float)? = nil
     let forceBuf: MTLBuffer
+    private(set) var epsBuf: MTLBuffer
+    private(set) var usesEps = false
     private(set) var stepsDone: Int = 0
     private let runState = RunState()
     var gpuSeconds: Double { runState.gpuSeconds }
@@ -176,10 +178,12 @@ final class Simulation {
               let sm = gpu.device.makeBuffer(length: n * 4, options: .storageModeShared),
               let lm = gpu.device.makeBuffer(length: n * 4, options: .storageModeShared),
               let mo = gpu.device.makeBuffer(length: n * 16, options: .storageModeShared),
-              let fo = gpu.device.makeBuffer(length: wantsForces ? n * 16 : 16, options: .storageModeShared) else {
+              let fo = gpu.device.makeBuffer(length: wantsForces ? n * 16 : 16, options: .storageModeShared),
+              let ep = gpu.device.makeBuffer(length: 16, options: .storageModeShared) else {
             throw KarmanError.message("buffer allocation failed")
         }
         fBuf = f; flagBuf = fl; solidMaskBuf = sm; lidMaskBuf = lm; momentsBuf = mo; forceBuf = fo
+        epsBuf = ep
         memset(fBuf.contents(), 0, fBuf.length) // shifted equilibrium at rest is exactly 0
 
         // Flags and per-cell neighbor masks (bit i-1: neighbor at n + c_i).
@@ -233,7 +237,8 @@ final class Simulation {
                       ulidX: lidVel.x * r, ulidY: lidVel.y * r, ulidZ: lidVel.z * r,
                       spongeX0: sponge?.x0 ?? 1e9,
                       spongeInvW: sponge.map { 1.0 / $0.width } ?? 0,
-                      spongeTau: sponge?.tau ?? 1.0)
+                      spongeTau: sponge?.tau ?? 1.0,
+                      useEps: usesEps ? 1 : 0)
     }
 
     /// Steps (absolute indices) whose odd pass should accumulate forces.
@@ -260,6 +265,7 @@ final class Simulation {
             enc.setBuffer(solidMaskBuf, offset: 0, index: 2)
             enc.setBuffer(lidMaskBuf, offset: 0, index: 3)
             enc.setBuffer(forceBuf, offset: 0, index: 5)
+            enc.setBuffer(epsBuf, offset: 0, index: 6)
             for s in 0..<batch {
                 var p = params(step: stepsDone + s,
                                writeForce: forceSteps.contains(stepsDone + s))
@@ -324,6 +330,17 @@ final class Simulation {
             total += SIMD3(Double(v.x), Double(v.y), Double(v.z))
         }}
         return total
+    }
+
+    /// Install a Noble-Torczynski solid-fraction field (curved boundaries).
+    func setSolidFractions(_ eps: [Float]) throws {
+        precondition(eps.count == cells)
+        guard let buf = gpu.device.makeBuffer(bytes: eps, length: cells * 4,
+                                              options: .storageModeShared) else {
+            throw KarmanError.message("eps buffer allocation failed")
+        }
+        epsBuf = buf
+        usesEps = true
     }
 
     /// mode 1 = Taylor-Green (2D, one period per box), amplitude in lattice units.
