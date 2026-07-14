@@ -2,9 +2,9 @@ import Foundation
 import Metal
 import CryptoKit
 
-enum Precision: String {
+public enum Precision: String, Sendable {
     case fp32, fp16s
-    var ddfBytes: Int { self == .fp32 ? 4 : 2 }
+    public var ddfBytes: Int { self == .fp32 ? 4 : 2 }
 }
 
 struct Params {
@@ -23,6 +23,19 @@ struct Params {
     var useEps: UInt32 = 0
 }
 
+/// Mirror of the colorize kernel's VizParams.
+public struct VizParams {
+    public var nx: UInt32, ny: UInt32, nz: UInt32, zSlice: UInt32
+    public var uref: Float
+    public var useEps: UInt32
+    public var pad0: Float = 0, pad1: Float = 0
+    public init(nx: UInt32, ny: UInt32, nz: UInt32, zSlice: UInt32,
+                uref: Float, useEps: UInt32) {
+        self.nx = nx; self.ny = ny; self.nz = nz; self.zSlice = zSlice
+        self.uref = uref; self.useEps = useEps
+    }
+}
+
 struct InitParams {
     var nx: UInt32, ny: UInt32, nz: UInt32, mode: UInt32
     var amplitude: Float
@@ -30,7 +43,7 @@ struct InitParams {
     var pad1: Float = 0, pad2: Float = 0
 }
 
-enum Cell: UInt8 {
+public enum Cell: UInt8, Sendable {
     case fluid = 0
     case solid = 1
     case lid = 2     // solid + moving (+x)
@@ -44,13 +57,14 @@ struct Pipelines {
     let initField: MTLComputePipelineState
 }
 
-final class GPU {
-    let device: MTLDevice
-    let queue: MTLCommandQueue
+public final class GPU {
+    public let device: MTLDevice
+    public let queue: MTLCommandQueue
     private var pipelines: [Precision: Pipelines] = [:]
+    private var libraries: [Precision: MTLLibrary] = [:]
     private let source: String
 
-    init() throws {
+    public init() throws {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
             throw KarmanError.noDevice
@@ -73,6 +87,7 @@ final class GPU {
         options.mathFloatingPointFunctions = .precise
         options.preprocessorMacros = ["FPXX": (precision == .fp32 ? "float" : "half") as NSString]
         let library = try device.makeLibrary(source: source, options: options)
+        libraries[precision] = library
         func pipeline(_ name: String) throws -> MTLComputePipelineState {
             guard let fn = library.makeFunction(name: name) else {
                 throw KarmanError.message("kernel \(name) not found")
@@ -85,12 +100,34 @@ final class GPU {
         pipelines[precision] = p
         return p
     }
+
+    /// Visualization pipelines: the |u| colorize compute kernel and a
+    /// fullscreen-quad render pipeline for the given drawable pixel format.
+    public func makeVizPipelines(precision: Precision, pixelFormat: MTLPixelFormat)
+        throws -> (colorize: MTLComputePipelineState, quad: MTLRenderPipelineState) {
+        _ = try pipelines(for: precision) // ensures the library is compiled
+        guard let library = libraries[precision] else {
+            throw KarmanError.message("library missing")
+        }
+        guard let cfn = library.makeFunction(name: "colorize"),
+              let vfn = library.makeFunction(name: "fsqVertex"),
+              let ffn = library.makeFunction(name: "fsqFragment") else {
+            throw KarmanError.message("viz kernels not found")
+        }
+        let colorize = try device.makeComputePipelineState(function: cfn)
+        let desc = MTLRenderPipelineDescriptor()
+        desc.vertexFunction = vfn
+        desc.fragmentFunction = ffn
+        desc.colorAttachments[0].pixelFormat = pixelFormat
+        let quad = try device.makeRenderPipelineState(descriptor: desc)
+        return (colorize, quad)
+    }
 }
 
-enum KarmanError: Error, CustomStringConvertible {
+public enum KarmanError: Error, CustomStringConvertible {
     case noDevice
     case message(String)
-    var description: String {
+    public var description: String {
         switch self {
         case .noDevice: return "no Metal device"
         case .message(let m): return m
@@ -113,48 +150,48 @@ final class RunState: @unchecked Sendable {
     var firstErrorCode: UInt? { lock.lock(); defer { lock.unlock() }; return _firstErrorCode }
 }
 
-final class Simulation {
-    let gpu: GPU
-    let precision: Precision
+public final class Simulation {
+    public let gpu: GPU
+    public let precision: Precision
     let pipes: Pipelines
-    let nx: Int, ny: Int, nz: Int
-    var cells: Int { nx * ny * nz }
-    let fBuf: MTLBuffer
+    public let nx: Int, ny: Int, nz: Int
+    public var cells: Int { nx * ny * nz }
+    public let fBuf: MTLBuffer
     let flagBuf: MTLBuffer
     let solidMaskBuf: MTLBuffer
     let lidMaskBuf: MTLBuffer
     let momentsBuf: MTLBuffer
-    var omega: Float
-    var omegaMinus: Float
-    var lidVel: SIMD3<Float>
-    var uinTarget: Float
-    var rampSteps: Int
-    var force: SIMD3<Float>
-    var cSmago: Float
-    var sponge: (x0: Float, width: Float, tau: Float)? = nil
+    public var omega: Float
+    public var omegaMinus: Float
+    public var lidVel: SIMD3<Float>
+    public var uinTarget: Float
+    public var rampSteps: Int
+    public var force: SIMD3<Float>
+    public var cSmago: Float
+    public var sponge: (x0: Float, width: Float, tau: Float)? = nil
     let forceBuf: MTLBuffer
     private(set) var epsBuf: MTLBuffer
     private(set) var usesEps = false
-    private(set) var stepsDone: Int = 0
+    public private(set) var stepsDone: Int = 0
     private let runState = RunState()
-    var gpuSeconds: Double { runState.gpuSeconds }
+    public var gpuSeconds: Double { runState.gpuSeconds }
 
     // D3Q19 direction table mirroring Kernels.metal (order is load-bearing).
-    static let cx: [Int] = [0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0]
-    static let cy: [Int] = [0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1]
-    static let cz: [Int] = [0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1]
+    public static let cx: [Int] = [0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1, 1,-1, 0, 0, 0, 0]
+    public static let cy: [Int] = [0, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 0, 0, 1,-1, 1,-1]
+    public static let cz: [Int] = [0, 0, 0, 0, 0, 1,-1, 0, 0, 0, 0, 1,-1,-1, 1, 1,-1,-1, 1]
 
     /// tau -> (omega+, omega-) via the TRT magic parameter Lambda.
     /// Lambda = 1/4 is the stability optimum; 3/16 makes halfway bounce-back
     /// walls viscosity-exact. omegaMinus == omega+ recovers SRT identically.
-    static func trtOmegas(tau: Double, lambda: Double?) -> (Float, Float) {
+    public static func trtOmegas(tau: Double, lambda: Double?) -> (Float, Float) {
         let wp = 1.0 / tau
         guard let lambda else { return (Float(wp), Float(wp)) } // SRT
         let tm = 0.5 + lambda / (tau - 0.5)
         return (Float(wp), Float(1.0 / tm))
     }
 
-    init(gpu: GPU, precision: Precision = .fp32, nx: Int, ny: Int, nz: Int,
+    public init(gpu: GPU, precision: Precision = .fp32, nx: Int, ny: Int, nz: Int,
          omega: Float, omegaMinus: Float? = nil,
          lid: SIMD3<Float> = .zero, uin: Float = 0, rampSteps: Int = 0,
          force: SIMD3<Float> = .zero, cSmago: Float = 0,
@@ -246,7 +283,7 @@ final class Simulation {
 
     /// Run `count` steps. Chunked into command buffers small enough to stay
     /// under the GPU watchdog; up to two buffers in flight.
-    func run(steps count: Int) throws {
+    public func run(steps count: Int) throws {
         let n = cells
         let stepsPerCB = max(2, min(2000, 40_000_000 / max(1, n / 16))) & ~1
         let inflight = DispatchSemaphore(value: 2)
@@ -292,7 +329,7 @@ final class Simulation {
     }
 
     /// (ux, uy, uz, rho) per cell. Only valid after an even number of steps.
-    func probeMoments() throws -> UnsafeBufferPointer<SIMD4<Float>> {
+    public func probeMoments() throws -> UnsafeBufferPointer<SIMD4<Float>> {
         precondition(stepsDone % 2 == 0, "moments probe requires even step count")
         guard let cb = gpu.queue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else {
@@ -317,7 +354,7 @@ final class Simulation {
     /// accumulation on the odd pass, then sums per-cell contributions on the
     /// CPU (double, fixed order — deterministic) over cells inside the given
     /// bounding box. Requires wantsForces at init and an even step count.
-    func probeForce(xRange: ClosedRange<Int>, yRange: ClosedRange<Int>) throws -> SIMD3<Double> {
+    public func probeForce(xRange: ClosedRange<Int>, yRange: ClosedRange<Int>) throws -> SIMD3<Double> {
         precondition(stepsDone % 2 == 0, "force probe requires even step count")
         memset(forceBuf.contents(), 0, forceBuf.length)
         forceSteps = [stepsDone + 1]
@@ -332,8 +369,46 @@ final class Simulation {
         return total
     }
 
+    /// Encode `count` steps onto an existing compute encoder (render-loop
+    /// path: no waiting, no chunking — caller owns the command buffer and
+    /// must keep dispatches under the GPU watchdog budget).
+    public func encode(steps count: Int, on enc: MTLComputeCommandEncoder) {
+        let n = cells
+        enc.setComputePipelineState(pipes.step)
+        enc.setBuffer(fBuf, offset: 0, index: 0)
+        enc.setBuffer(flagBuf, offset: 0, index: 1)
+        enc.setBuffer(solidMaskBuf, offset: 0, index: 2)
+        enc.setBuffer(lidMaskBuf, offset: 0, index: 3)
+        enc.setBuffer(forceBuf, offset: 0, index: 5)
+        enc.setBuffer(epsBuf, offset: 0, index: 6)
+        for s in 0..<count {
+            var p = params(step: stepsDone + s)
+            enc.setBytes(&p, length: MemoryLayout<Params>.stride, index: 4)
+            enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        }
+        stepsDone += count
+    }
+
+    /// Encode the moments probe (valid when total steps will be even).
+    public func encodeMoments(on enc: MTLComputeCommandEncoder) {
+        enc.setComputePipelineState(pipes.moments)
+        enc.setBuffer(fBuf, offset: 0, index: 0)
+        enc.setBuffer(flagBuf, offset: 0, index: 1)
+        enc.setBuffer(momentsBuf, offset: 0, index: 2)
+        var p = params(step: stepsDone)
+        enc.setBytes(&p, length: MemoryLayout<Params>.stride, index: 3)
+        enc.dispatchThreads(MTLSize(width: cells, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    public var momentsBuffer: MTLBuffer { momentsBuf }
+    public var flagsBuffer: MTLBuffer { flagBuf }
+    public var epsBuffer: MTLBuffer { epsBuf }
+    public var usesEpsField: Bool { usesEps }
+
     /// Install a Noble-Torczynski solid-fraction field (curved boundaries).
-    func setSolidFractions(_ eps: [Float]) throws {
+    public func setSolidFractions(_ eps: [Float]) throws {
         precondition(eps.count == cells)
         guard let buf = gpu.device.makeBuffer(bytes: eps, length: cells * 4,
                                               options: .storageModeShared) else {
@@ -344,7 +419,7 @@ final class Simulation {
     }
 
     /// mode 1 = Taylor-Green (2D, one period per box), amplitude in lattice units.
-    func initField(mode: UInt32, amplitude: Float) throws {
+    public func initField(mode: UInt32, amplitude: Float) throws {
         guard let cb = gpu.queue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else {
             throw KarmanError.message("command buffer creation failed")
@@ -361,13 +436,13 @@ final class Simulation {
         cb.waitUntilCompleted()
     }
 
-    var stateDigest: String {
+    public var stateDigest: String {
         let data = Data(bytes: fBuf.contents(), count: fBuf.length)
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Total shifted-density sum (double accumulation) — mass drift probe.
-    func massSum() -> Double {
+    public func massSum() -> Double {
         var total = 0.0
         switch precision {
         case .fp32:

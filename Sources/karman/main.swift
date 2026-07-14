@@ -1,4 +1,5 @@
 import Foundation
+import KarmanCore
 
 // karman CLI — M0 spike driver.
 //   karman selftest              parity/indexing proofs

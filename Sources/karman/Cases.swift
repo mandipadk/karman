@@ -1,4 +1,5 @@
 import Foundation
+import KarmanCore
 
 // MARK: - Ghia, Ghia & Shin (1982) oracle — interior points only (boundary
 // rows are identically satisfied by the BCs). Columns: coordinate, Re=100,
@@ -433,30 +434,6 @@ func runChannelTest(gpu: GPU, D: Int = 40, uinMax: Float = 0.075) throws -> Gate
                       detail: String(format: "flux/nominal: col1 %.4f, mid %.4f, exit %.4f; rho: %.5f / %.5f / %.5f",
                                      a.flux / nominal, b.flux / nominal, c.flux / nominal,
                                      a.rho, b.rho, c.rho))
-}
-
-/// Supersampled solid fraction of a disk over the cell grid (16×16 per cell)
-/// — the input the Noble-Torczynski cells need; later this is exactly what
-/// STL voxelization produces.
-func diskSolidFractions(nx: Int, ny: Int, cx: Double, cy: Double, r: Double) -> [Float] {
-    var eps = [Float](repeating: 0, count: nx * ny)
-    let r2 = r * r
-    let sub = 16
-    let lo = Int(cx - r) - 2, hi = Int(cx + r) + 2
-    let loY = Int(cy - r) - 2, hiY = Int(cy + r) + 2
-    for y in max(0, loY)...min(ny - 1, hiY) {
-        for x in max(0, lo)...min(nx - 1, hi) {
-            var inside = 0
-            for sy in 0..<sub { for sx in 0..<sub {
-                let px = Double(x) - 0.5 + (Double(sx) + 0.5) / Double(sub)
-                let py = Double(y) - 0.5 + (Double(sy) + 0.5) / Double(sub)
-                let dx = px - cx, dy = py - cy
-                if dx * dx + dy * dy <= r2 { inside += 1 }
-            }}
-            eps[y * nx + x] = Float(inside) / Float(sub * sub)
-        }
-    }
-    return eps
 }
 
 // MARK: - Schäfer–Turek DFG 2D-1 (steady cylinder drag)

@@ -420,3 +420,66 @@ kernel void initField(device FPXX*         f [[buffer(0)]],
         f[fidx(i, n, N)] = (FPXX)(feq + fneq);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Visualization: |u| colormap into a texture + fullscreen-quad render.
+
+struct VizParams {
+    uint  nx, ny, nz, zSlice;
+    float uref;
+    uint  useEps;
+    float pad0, pad1;
+};
+
+inline half3 speedColor(float s) {
+    // three-stop map: deep navy -> cyan -> warm yellow
+    const float3 c0 = float3(0.05, 0.06, 0.20);
+    const float3 c1 = float3(0.10, 0.75, 0.85);
+    const float3 c2 = float3(1.00, 0.92, 0.35);
+    float3 c = (s < 0.5f) ? mix(c0, c1, s * 2.0f) : mix(c1, c2, (s - 0.5f) * 2.0f);
+    return half3(c);
+}
+
+kernel void colorize(device const float4* moments [[buffer(0)]],
+                     device const uchar*  flags   [[buffer(1)]],
+                     device const float*  epsBuf  [[buffer(2)]],
+                     constant VizParams&  v       [[buffer(3)]],
+                     texture2d<half, access::write> tex [[texture(0)]],
+                     uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= v.nx || gid.y >= v.ny) { return; }
+    const uint n = (v.zSlice * v.ny + gid.y) * v.nx + gid.x;
+    const uchar flag = flags[n];
+    const float eps = (v.useEps != 0u) ? epsBuf[n] : 0.0f;
+    half3 rgb;
+    if (flag != FLAG_FLUID || eps >= 0.5f) {
+        rgb = half3(0.13h, 0.13h, 0.15h); // walls / bodies
+    } else {
+        const float3 u = moments[n].xyz;
+        const float s = clamp(length(u) / v.uref, 0.0f, 1.0f);
+        rgb = speedColor(s);
+        if (eps > 0.0f) { rgb = mix(rgb, half3(0.13h), half(eps)); }
+    }
+    tex.write(half4(rgb, 1.0h), uint2(gid.x, v.ny - 1u - gid.y)); // flip y
+}
+
+struct FSQOut {
+    float4 pos [[position]];
+    float2 uv;
+};
+
+vertex FSQOut fsqVertex(uint vid [[vertex_id]]) {
+    // fullscreen triangle
+    const float2 xy[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+    FSQOut out;
+    out.pos = float4(xy[vid], 0.0, 1.0);
+    out.uv = float2((xy[vid].x + 1.0) * 0.5, 1.0 - (xy[vid].y + 1.0) * 0.5);
+    return out;
+}
+
+fragment half4 fsqFragment(FSQOut in [[stage_in]],
+                           texture2d<half> tex [[texture(0)]])
+{
+    constexpr sampler smp(mag_filter::linear, min_filter::linear);
+    return tex.sample(smp, in.uv);
+}
