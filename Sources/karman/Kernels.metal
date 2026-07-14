@@ -56,6 +56,10 @@ struct Params {
     uint  writeForce;  // odd steps: accumulate momentum exchange per cell
     float ulidX, ulidY, ulidZ; // lid wall velocity (ramped)
     uint  pad0;
+    float spongeX0;    // sponge zone start (lattice x); >= nx disables
+    float spongeInvW;  // 1 / sponge width
+    float spongeTau;   // target tau at the far end of the sponge
+    float pad1;
 };
 
 constant uchar FLAG_FLUID   = 0;
@@ -89,8 +93,24 @@ inline float3 wallVel(uchar wallFlag, int wy, constant Params& p) {
 // momentum flux (no stencils); tau_eff via the closed form
 // tau_eff = (tau0 + sqrt(tau0^2 + 18*sqrt(2)*Cs^2*|Pi|/rho))/2; the TRT magic
 // parameter Lambda is preserved when rescaling both rates.
-inline void collide(thread float* fh, constant Params& p, thread float& rhoOut) {
+inline void collide(thread float* fh, constant Params& p, int x, thread float& rhoOut) {
     float wp = p.omega, wm = p.omegaMinus;
+    // Viscous sponge (outlet damping): ramp tau toward spongeTau across the
+    // zone so unsteady wakes arrive at the velocity-wall outlet near the
+    // profile it enforces (an undamped vortex street meeting a forced
+    // parabola is a measured blowup). Lambda is preserved for TRT.
+    if ((float)x > p.spongeX0) {
+        const float frac = min(((float)x - p.spongeX0) * p.spongeInvW, 1.0f);
+        const float tau0 = 1.0f / wp;
+        const float tauS = tau0 + frac * (p.spongeTau - tau0);
+        if (p.omegaMinus == p.omega) {
+            wp = 1.0f / tauS; wm = wp;
+        } else {
+            const float lambda = (1.0f/wp - 0.5f) * (1.0f/wm - 0.5f);
+            wp = 1.0f / tauS;
+            wm = 1.0f / (0.5f + lambda / (tauS - 0.5f));
+        }
+    }
     float rhom1 = 0.0f;
     for (int i = 0; i < 19; i++) { rhom1 += fh[i]; }
     const float rho = 1.0f + rhom1;
@@ -184,7 +204,7 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
     if (p.parity == 0u) {
         // -------- even: pure in-cell pass --------
         for (int i = 0; i < 19; i++) { fh[i] = (float)f[fidx(i, n, N)]; }
-        collide(fh, p, rho);
+        collide(fh, p, x, rho);
         f[fidx(0, n, N)] = (FPXX)fh[0];
         for (int i = 1; i < 19; i++) { f[fidx(OPP[i], n, N)] = (FPXX)fh[i]; }
     } else {
@@ -241,7 +261,7 @@ kernel void step(device FPXX*        f         [[buffer(0)]],
                 }
             }
         }
-        collide(fh, p, rho);
+        collide(fh, p, x, rho);
         f[fidx(0, n, N)] = (FPXX)fh[0];
         for (int i = 1; i < 19; i++) {
             const int dstBit = i - 1;

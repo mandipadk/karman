@@ -17,6 +17,10 @@ struct Params {
     var writeForce: UInt32
     var ulidX: Float, ulidY: Float, ulidZ: Float
     var pad0: UInt32 = 0
+    var spongeX0: Float = 1e9
+    var spongeInvW: Float = 0
+    var spongeTau: Float = 1.0
+    var pad1: Float = 0
 }
 
 struct InitParams {
@@ -127,6 +131,7 @@ final class Simulation {
     var rampSteps: Int
     var force: SIMD3<Float>
     var cSmago: Float
+    var sponge: (x0: Float, width: Float, tau: Float)? = nil
     let forceBuf: MTLBuffer
     private(set) var stepsDone: Int = 0
     private let runState = RunState()
@@ -210,7 +215,12 @@ final class Simulation {
 
     private func ramp(_ target: Float, atStep t: Int) -> Float {
         guard rampSteps > 0 else { return target }
-        return target * Float(min(1.0, Double(t) / Double(rampSteps)))
+        let x = min(1.0, Double(t) / Double(rampSteps))
+        // C¹ cosine ramp: a linear ramp's end-kink is a broadband acoustic
+        // kick that rings essentially undamped in a low-viscosity duct
+        // (measured: a duct-fundamental C_D oscillation as large as the
+        // physical one). Smooth turn-on excites it far less.
+        return target * Float(0.5 * (1.0 - cos(Double.pi * x)))
     }
 
     private func params(step t: Int, writeForce: Bool = false) -> Params {
@@ -220,7 +230,10 @@ final class Simulation {
                       uin: uinTarget * r, cSmago: cSmago,
                       fx: force.x, fy: force.y, fz: force.z,
                       writeForce: writeForce ? 1 : 0,
-                      ulidX: lidVel.x * r, ulidY: lidVel.y * r, ulidZ: lidVel.z * r)
+                      ulidX: lidVel.x * r, ulidY: lidVel.y * r, ulidZ: lidVel.z * r,
+                      spongeX0: sponge?.x0 ?? 1e9,
+                      spongeInvW: sponge.map { 1.0 / $0.width } ?? 0,
+                      spongeTau: sponge?.tau ?? 1.0)
     }
 
     /// Steps (absolute indices) whose odd pass should accumulate forces.

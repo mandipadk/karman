@@ -40,6 +40,22 @@ func main() throws {
     case "determinism":
         results = [try runDeterminism(gpu: gpu, precision: .fp32),
                    try runDeterminism(gpu: gpu, precision: .fp16s)]
+    case "m2":
+        print("— DFG 2D-2 (Kármán vortex street) —")
+        for r in try runDFG2(gpu: gpu, D: 40) { printResult(r); results.append(r) }
+        let rep = try runDFG2Replay(gpu: gpu)
+        printResult(rep); results.append(rep)
+    case "debugdfg2":
+        try runDebugDFG2(gpu: gpu, lambda: 0.25)
+        results = []
+    case "dfg2":
+        let d2 = args.dropFirst().first.flatMap { Int($0) } ?? 40
+        let u2 = args.dropFirst(2).first.flatMap { Float($0) } ?? 0.075
+        let len = args.dropFirst(3).first.flatMap { Int($0) } ?? 22
+        let spD = args.dropFirst(4).first.flatMap { Int($0) } ?? 3
+        let spT = args.dropFirst(5).first.flatMap { Float($0) } ?? 1.0
+        results = try runDFG2(gpu: gpu, D: d2, uinMax: u2, lengthD: len,
+                              spongeD: spD, spongeTau: spT)
     case "debugles":
         try runDebugLES(gpu: gpu, re: 1e5, cSmago: 0.01, lambda: 0.25)
         try runDebugLES(gpu: gpu, re: 1e5, cSmago: 0.04, lambda: 0.25)
