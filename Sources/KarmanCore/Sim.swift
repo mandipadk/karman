@@ -16,7 +16,7 @@ struct Params {
     var fx: Float, fy: Float, fz: Float
     var writeForce: UInt32
     var ulidX: Float, ulidY: Float, ulidZ: Float
-    var pad0: UInt32 = 0
+    var inflowUniform: UInt32 = 0
     var spongeX0: Float = 1e9
     var spongeInvW: Float = 0
     var spongeTau: Float = 1.0
@@ -168,6 +168,7 @@ public final class Simulation {
     public var rampSteps: Int
     public var force: SIMD3<Float>
     public var cSmago: Float
+    public var inflowUniform = false
     public var sponge: (x0: Float, width: Float, tau: Float)? = nil
     let forceBuf: MTLBuffer
     private(set) var epsBuf: MTLBuffer
@@ -272,6 +273,7 @@ public final class Simulation {
                       fx: force.x, fy: force.y, fz: force.z,
                       writeForce: writeForce ? 1 : 0,
                       ulidX: lidVel.x * r, ulidY: lidVel.y * r, ulidZ: lidVel.z * r,
+                      inflowUniform: inflowUniform ? 1 : 0,
                       spongeX0: sponge?.x0 ?? 1e9,
                       spongeInvW: sponge.map { 1.0 / $0.width } ?? 0,
                       spongeTau: sponge?.tau ?? 1.0,
@@ -362,10 +364,10 @@ public final class Simulation {
         forceSteps = []
         let ptr = forceBuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: cells)
         var total = SIMD3<Double>.zero
-        for y in yRange { for x in xRange {
-            let v = ptr[y * nx + x]
+        for z in 0..<nz { for y in yRange { for x in xRange {
+            let v = ptr[(z * ny + y) * nx + x]
             total += SIMD3(Double(v.x), Double(v.y), Double(v.z))
-        }}
+        }}}
         return total
     }
 

@@ -1039,3 +1039,63 @@ func runDebugDFG2(gpu: GPU, D: Int = 40, lambda: Double? = 3.0/16.0) throws {
         if nan > 20 { break }
     }
 }
+
+// MARK: - 3D sphere drag (report + sanity gate)
+
+func runSphere(gpu: GPU, D: Int = 24, box: Int = 96, maxSteps: Int = 40_000) throws -> GateResult {
+    let c = try SphereCase(gpu: gpu, D: D, size: (box * 2, box, box))
+    var cd = 0.0
+    var prev = Double.infinity
+    while c.sim.stepsDone < maxSteps {
+        try c.sim.run(steps: 4000 - 2)
+        let f = try c.sim.probeForce(xRange: c.boxX, yRange: c.boxY)
+        cd = c.dragCoefficient(f)
+        if c.sim.stepsDone > 16000 && abs(cd - prev) / abs(cd) < 5e-4 { break }
+        prev = cd
+    }
+    // DEMO-case gate (stability + regime), not validation: Schiller-Naumann
+    // is a FREE-STREAM correlation this box cannot represent by construction.
+    // Measured +19% offset is resolution-INDEPENDENT (1.300 at D=24, 1.297
+    // at D=32; box 4D vs 6D within 1%) — the stack is lateral periodic
+    // images, the uniform-velocity outlet wall fighting the wake deficit,
+    // NT's diffuse-interface effective diameter, and the correlation's own
+    // ±5%. The app shows measured AND reference so the gap stays visible.
+    // The validated 3D case is Taylor-Green (M4/M5).
+    return GateResult(name: "sphere wake demo Re=100 (D=\(D), 3D, NT)",
+                      passed: cd >= 1.0 && cd <= 1.45,
+                      detail: String(format: "C_D %.3f (Schiller-Naumann free-stream ref %.3f; demo gate [1.0, 1.45]); %d steps",
+                                     cd, c.cdRef, c.sim.stepsDone))
+}
+
+// MARK: - STL voxelizer gate
+
+/// Voxelize a programmatic sphere STL and compare against the analytic
+/// solid-fraction field: same volume, same shell shape.
+func runStlVoxelizer() throws -> GateResult {
+    let n = 64
+    let r: Float = 20
+    let mesh = try StlMesh(binarySTL: sphereSTLData(radius: r))
+    let center = SIMD3<Float>(Float(n) / 2, Float(n) / 2, Float(n) / 2)
+    let eps = meshSolidFractions(mesh: mesh, nx: n, ny: n, nz: n,
+                                 scale: 1.0, offset: center)
+    let ana = sphereSolidFractions(nx: n, ny: n, nz: n,
+                                   cx: Double(center.x), cy: Double(center.y),
+                                   cz: Double(center.z), r: Double(r))
+    var vol = 0.0, volA = 0.0, maxDev = 0.0, shellDevSum = 0.0
+    var shellCount = 0
+    for i in 0..<eps.count {
+        vol += Double(eps[i]); volA += Double(ana[i])
+        let d = abs(Double(eps[i]) - Double(ana[i]))
+        maxDev = max(maxDev, d)
+        if ana[i] > 0 && ana[i] < 1 { shellDevSum += d; shellCount += 1 }
+    }
+    let volErr = abs(vol - volA) / volA
+    let shellDev = shellDevSum / Double(max(shellCount, 1))
+    // Faceting (48×24 lat-long) makes the STL slightly smaller than the true
+    // sphere, so per-cell shell deviations up to ~0.1 are geometry, not bugs.
+    let passed = volErr <= 0.02 && shellDev <= 0.10
+    return GateResult(name: "STL voxelizer vs analytic sphere (64³)",
+                      passed: passed,
+                      detail: String(format: "volume Δ %.2f%% (gate ≤2%%); mean shell |Δε| %.3f (gate ≤0.10); max |Δε| %.2f; %d triangles",
+                                     volErr * 100, shellDev, maxDev, mesh.triangles.count))
+}

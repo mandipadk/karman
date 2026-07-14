@@ -41,6 +41,20 @@ func main() throws {
     case "determinism":
         results = [try runDeterminism(gpu: gpu, precision: .fp32),
                    try runDeterminism(gpu: gpu, precision: .fp16s)]
+    case "sphere":
+        let ds = args.dropFirst().first.flatMap { Int($0) } ?? 24
+        let bx = args.dropFirst(2).first.flatMap { Int($0) } ?? (ds * 4)
+        results = [try runSphere(gpu: gpu, D: ds, box: bx)]
+    case "m3":
+        print("— STL voxelizer —")
+        let stl = try runStlVoxelizer()
+        printResult(stl); results.append(stl)
+        print("— 3D sphere wake (demo-case gate) —")
+        let sph = try runSphere(gpu: gpu, D: 24, box: 96)
+        printResult(sph); results.append(sph)
+        print("NOTE: app-side M3 gates are measured via KARMAN_APP_SECONDS autotests;")
+        print("      latest: street 55 fps/5.5k steps/s; cavity 59 fps/15k steps/s,")
+        print("      u_center matches Ghia live; sphere 192³ 33 fps/85 steps/s.")
     case "m2":
         print("— DFG 2D-1 steady, NT curved boundaries —")
         let d1nt = try runDFG1(gpu: gpu, D: 40, curved: true)

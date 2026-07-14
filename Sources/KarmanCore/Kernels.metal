@@ -55,7 +55,7 @@ struct Params {
     float fx, fy, fz;  // uniform body force density (lattice units)
     uint  writeForce;  // odd steps: accumulate momentum exchange per cell
     float ulidX, ulidY, ulidZ; // lid wall velocity (ramped)
-    uint  pad0;
+    uint  inflowUniform;       // 1: inflow walls impose uniform uin (not parabolic)
     float spongeX0;    // sponge zone start (lattice x); >= nx disables
     float spongeInvW;  // 1 / sponge width
     float spongeTau;   // target tau at the far end of the sponge
@@ -80,6 +80,7 @@ inline int wrap(int v, int n) {
 // inflow = parabolic +x profile across the channel (walls at y=0.5, ny-1.5).
 inline float3 wallVel(uchar wallFlag, int wy, constant Params& p) {
     if (wallFlag == FLAG_LID) { return float3(p.ulidX, p.ulidY, p.ulidZ); }
+    if (p.inflowUniform != 0u) { return float3(p.uin, 0.0f, 0.0f); }
     const float H  = (float)p.ny - 2.0f;
     const float yd = (float)wy - 0.5f;
     return float3(max(4.0f * p.uin * yd * (H - yd) / (H * H), 0.0f), 0.0f, 0.0f);
