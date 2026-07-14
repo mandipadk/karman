@@ -42,6 +42,9 @@ struct ContentView: View {
                 Slider(value: $controller.budgetMs, in: 2...30, step: 1) {
                     Text("GPU budget/frame (ms)")
                 }.frame(width: 220)
+                Button("Import STL…") { controller.beginImport() }
+                Button("Export QoIs…") { controller.exportCSV() }
+                    .disabled(!controller.hasHistory)
                 Spacer()
             }
             .padding(10)
@@ -65,7 +68,44 @@ struct ContentView: View {
             .padding(10)
         }
         .frame(minWidth: 980, minHeight: 380)
-        .onChange(of: controller.selectedCase) { controller.reset() }
+        .onChange(of: controller.selectedCase) { controller.selectBuiltin() }
+        .fileImporter(isPresented: $controller.showImporter,
+                      allowedContentTypes: [.data, .item]) { result in
+            if case .success(let url) = result { controller.stlChosen(url) }
+        }
+        .sheet(isPresented: $controller.showUnitsSheet) {
+            UnitsSheet().environmentObject(controller)
+        }
+    }
+}
+
+/// The mandatory units prompt: STL carries no units, and a silent unit
+/// error would poison every number downstream of a verification-first tool.
+struct UnitsSheet: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("STL has no units — define the physics")
+                .font(.headline)
+            Form {
+                TextField("Body length along x (m)", value: $controller.stlLengthM, format: .number)
+                TextField("Flow speed (m/s)", value: $controller.stlSpeedMS, format: .number)
+                Picker("Fluid", selection: $controller.stlFluid) {
+                    Text("Air (ν = 1.5e-5 m²/s)").tag(0)
+                    Text("Water (ν = 1.0e-6 m²/s)").tag(1)
+                }
+            }
+            Text(controller.stlPreview)
+                .font(.system(.caption, design: .monospaced))
+            HStack {
+                Spacer()
+                Button("Cancel") { controller.showUnitsSheet = false }
+                Button("Run") { controller.buildCustom() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 430)
     }
 }
 
@@ -145,6 +185,26 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var selectedCase: FlowCase = .street
     @Published var running = true
     @Published var budgetMs: Double = 12
+    // STL import flow
+    @Published var showImporter = false
+    @Published var showUnitsSheet = false
+    @Published var stlLengthM: Double = 0.1
+    @Published var stlSpeedMS: Double = 0.5
+    @Published var stlFluid: Int = 0
+    private var stlURL: URL?
+    private var stlMesh: StlMesh?
+    /// Rebuilds the current case (builtin picker choice or imported STL).
+    private var currentBuilder: (() throws -> ActiveCase)!
+    var hasHistory: Bool { !history.isEmpty }
+    var stlPreview: String {
+        guard let mesh = stlMesh else { return "" }
+        let nu = stlFluid == 0 ? 1.5e-5 : 1.0e-6
+        let re = stlSpeedMS * stlLengthM / nu
+        let ext = mesh.boundsMax - mesh.boundsMin
+        return String(format: "%d triangles · extent %.2g × %.2g × %.2g (mesh units) · Re %.0f%@",
+                      mesh.triangles.count, ext.x, ext.y, ext.z, re,
+                      re > 5e4 ? " ⚠ high Re: LES will be enabled" : "")
+    }
     @Published var statsLine = "starting…"
     @Published var qoiLine = ""
     @Published var setupLine = ""
@@ -166,6 +226,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     override init() {
         gpu = try! GPU()
         active = try! Self.build(.street, gpu: gpu)
+        currentBuilder = { [gpu] in try Self.build(.street, gpu: gpu) }
         (colorize, quad) = try! gpu.makeVizPipelines(precision: .fp32, pixelFormat: .bgra8Unorm)
         fieldTex = Self.makeFieldTexture(device: gpu.device, sim: active.sim)
         super.init()
@@ -176,11 +237,18 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             if let c = ProcessInfo.processInfo.environment["STROUHAL_APP_CASE"],
                let fc = FlowCase.allCases.first(where: { $0.rawValue.lowercased().contains(c) }) {
                 selectedCase = fc
-                reset()
+                selectBuiltin()
+            }
+            if let stl = ProcessInfo.processInfo.environment["STROUHAL_APP_STL"] {
+                stlChosen(URL(fileURLWithPath: stl))
+                showUnitsSheet = false
+                buildCustom()
             }
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(t))
                 print("AUTOTEST \(self?.statsLine ?? "") | \(self?.qoiLine ?? "")")
+                print("SETUP    \(self?.setupLine ?? "")")
+                print("ENVELOPE \(self?.envelopeLine ?? "")")
                 exit(0)
             }
         }
@@ -196,7 +264,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             return ActiveCase(
                 sim: vs.sim, uref: vs.uMax * 1.6, zSlice: 0,
                 setupLine: "DFG 2D-2 · D 0.1 m · U 1.0 m/s · Re 100 · \(vs.sim.nx)×\(vs.sim.ny)",
-                envelope: units.envelope(speed: 1.0, nu: 1e-3),
+                envelope: units.envelope(speed: 1.0, nu: 1e-3, cellsPerFeature: vs.D),
                 probe: { sim in
                     let f = try sim.probeForce(xRange: vs.boxX, yRange: vs.boxY)
                     let d = vs.uMean * vs.uMean * Double(vs.D)
@@ -228,7 +296,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             return ActiveCase(
                 sim: sp.sim, uref: Float(sp.u) * 1.8, zSlice: sp.sim.nz / 2,
                 setupLine: "Sphere wake · D 5 cm · U 0.03 m/s (air) · Re 100 · 192³",
-                envelope: units.envelope(speed: 0.03, nu: 1.5e-5),
+                envelope: units.envelope(speed: 0.03, nu: 1.5e-5, cellsPerFeature: sp.D),
                 probe: { sim in
                     let f = try sim.probeForce(xRange: sp.boxX, yRange: sp.boxY)
                     return (sp.dragCoefficient(f), 0)
@@ -239,8 +307,9 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     }
 
     static func envelopeText(_ e: UnitScales.Envelope) -> String {
-        let ok = e.ok ? "✓ in envelope" : "⚠ " + e.warnings.joined(separator: "; ")
-        return String(format: "Ma %.3f · τ %.3f · %@", e.mach, e.tau, ok)
+        let head = String(format: "Ma %.3f · τ %.4f", e.mach, e.tau)
+        return e.ok ? head + " · ✓ within the method's validity envelope"
+                    : head + " · ⚠ " + e.warnings.joined(separator: " · ")
     }
 
     static func makeFieldTexture(device: MTLDevice, sim: Simulation) -> MTLTexture {
@@ -252,9 +321,124 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         return device.makeTexture(descriptor: d)!
     }
 
+    func selectBuiltin() {
+        let c = selectedCase
+        currentBuilder = { [gpu] in try Self.build(c, gpu: gpu) }
+        reset()
+    }
+
+    func beginImport() { showImporter = true }
+
+    func stlChosen(_ url: URL) {
+        do {
+            let ok = url.startAccessingSecurityScopedResource()
+            defer { if ok { url.stopAccessingSecurityScopedResource() } }
+            stlMesh = try StlMesh(binarySTL: Data(contentsOf: url))
+            stlURL = url
+            showUnitsSheet = true
+        } catch {
+            statsLine = "STL load failed: \(error)"
+        }
+    }
+
+    func buildCustom() {
+        guard let mesh = stlMesh else { return }
+        showUnitsSheet = false
+        let name = stlURL?.lastPathComponent ?? "custom"
+        let lengthM = stlLengthM, speedMS = stlSpeedMS
+        let nu = stlFluid == 0 ? 1.5e-5 : 1.0e-6
+        currentBuilder = { [gpu] in
+            try Self.buildSTLCase(gpu: gpu, mesh: mesh, name: name,
+                                  lengthM: lengthM, speedMS: speedMS, nuSI: nu)
+        }
+        reset()
+    }
+
+    func exportCSV() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "strouhal-qoi.csv"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        var csv = "step,C_D,C_L\n"
+        for h in history {
+            csv += String(format: "%.0f,%.6f,%.6f\n", h.t, h.cd, h.cl)
+        }
+        try? csv.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    /// Flow past an imported body: uniform inflow, periodic lateral, NT body
+    /// from the voxelized mesh, sponge before the outlet. LES enables itself
+    /// when the Reynolds number pushes tau against the stability floor.
+    static func buildSTLCase(gpu: GPU, mesh: StlMesh, name: String,
+                             lengthM: Double, speedMS: Double, nuSI: Double) throws -> ActiveCase {
+        let re = speedMS * lengthM / nuSI
+        let D = 48 // cells along the body's longest axis
+        let ext = mesh.boundsMax - mesh.boundsMin
+        let maxExt = max(ext.x, max(ext.y, ext.z))
+        let scale = Float(D) / maxExt
+        let (nx, ny, nz) = (192, 128, 128)
+        let u: Float = 0.05
+        let nuLat = Double(u) * Double(D) / re
+        var tau = 3.0 * nuLat + 0.5
+        var cSmago: Float = 0
+        if tau < 0.52 { cSmago = 0.04; }
+        tau = max(tau, 0.5005)
+        let (wp, wm) = Simulation.trtOmegas(tau: tau, lambda: 3.0 / 16.0)
+        let sim = try Simulation(gpu: gpu, nx: nx, ny: ny, nz: nz,
+                                 omega: wp, omegaMinus: wm,
+                                 uin: u, rampSteps: 8000, cSmago: cSmago,
+                                 wantsForces: true) { x, _, _ in
+            (x == 0 || x == nx - 1) ? .inflow : .fluid
+        }
+        sim.inflowUniform = true
+        let meshCenter = (mesh.boundsMin + mesh.boundsMax) * 0.5
+        let target = SIMD3<Float>(Float(D) * 1.5, Float(ny) / 2, Float(nz) / 2)
+        let eps = meshSolidFractions(mesh: mesh, nx: nx, ny: ny, nz: nz,
+                                     scale: scale, offset: target - meshCenter * scale)
+        try sim.setSolidFractions(eps)
+        sim.sponge = (x0: Float(nx - 1 - D), width: Float(D), tau: 1.0)
+        // Projected frontal area + the body's bounding box in cells. The probe
+        // box MUST exclude the inlet/outlet velocity walls: they are moving-wall
+        // cells whose (large, upstream-directed) momentum exchange would swamp
+        // the body force — measured C_D = -4.06 before this was scoped.
+        var area = 0.0
+        var bx0 = nx, bx1 = -1, by0 = ny, by1 = -1
+        for z in 0..<nz { for y in 0..<ny {
+            var m: Float = 0
+            for x in 0..<nx {
+                let e = eps[(z * ny + y) * nx + x]
+                if e > 0 {
+                    bx0 = min(bx0, x); bx1 = max(bx1, x)
+                    by0 = min(by0, y); by1 = max(by1, y)
+                }
+                m = max(m, e)
+            }
+            area += Double(m)
+        }}
+        guard bx1 >= bx0, by1 >= by0 else {
+            throw StrouhalError.message("mesh voxelized to nothing — check units/scale")
+        }
+        let units = UnitScales(length: lengthM, cells: D, speed: speedMS,
+                               latticeSpeed: Double(u), density: 1.2)
+        let pad = 3
+        let boxX = max(1, bx0 - pad)...min(nx - 2, bx1 + pad)
+        let boxY = max(0, by0 - pad)...min(ny - 1, by1 + pad)
+        return ActiveCase(
+            sim: sim, uref: u * 1.8, zSlice: nz / 2,
+            setupLine: String(format: "%@ · L %.3g m · U %.3g m/s · Re %.0f · %d×%d×%d%@",
+                              name, lengthM, speedMS, re, nx, ny, nz,
+                              cSmago > 0 ? " · LES" : ""),
+            envelope: units.envelope(speed: speedMS, nu: nuSI, cellsPerFeature: D),
+            probe: { sim in
+                let f = try sim.probeForce(xRange: boxX, yRange: boxY)
+                return (2 * f.x / (Double(u) * Double(u) * area), 0)
+            },
+            strouhalD: nil, strouhalU: nil,
+            qoiStatic: { _ in String(format: "A_proj %.0f cells²", area) })
+    }
+
     func reset() {
         do {
-            active = try Self.build(selectedCase, gpu: gpu)
+            active = try currentBuilder()
             fieldTex = Self.makeFieldTexture(device: gpu.device, sim: active.sim)
             history.removeAll()
             sparkline = []

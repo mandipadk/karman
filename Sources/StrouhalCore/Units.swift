@@ -28,17 +28,46 @@ public struct UnitScales {
     public struct Envelope {
         public let mach: Double
         public let tau: Double
-        public var ok: Bool { mach <= 0.17 && tau > 0.5 && tau < 1.3 }
+        /// Cells across the body/feature, when the case has one.
+        public let cellsPerFeature: Int?
+        /// Reynolds number of the case, when defined.
+        public let re: Double?
+
+        public var ok: Bool { warnings.isEmpty }
+
         public var warnings: [String] {
             var w: [String] = []
-            if mach > 0.17 { w.append(String(format: "Ma=%.3f > 0.17: O(Ma²) compressibility error exceeds ~1%%", mach)) }
-            if tau <= 0.5 { w.append("tau <= 0.5: unstable without LES") }
-            if tau >= 1.3 { w.append(String(format: "tau=%.2f >= 1.3: accuracy degrades (over-relaxed)", tau)) }
+            if mach > 0.17 {
+                w.append(String(format: "Ma %.3f > 0.17 — O(Ma²) compressibility error above ~1%%", mach))
+            }
+            if tau <= 0.5 {
+                w.append("τ ≤ 0.5 — unstable")
+            } else if tau < 0.51 {
+                w.append(String(format: "τ %.4f — under-resolved; the answer leans on the LES model, not the grid", tau))
+            }
+            if tau >= 1.3 {
+                w.append(String(format: "τ %.2f ≥ 1.3 — over-relaxed, accuracy degrades", tau))
+            }
+            // Boundary-layer resolution: a bluff body's laminar BL thickness
+            // scales as D/sqrt(Re), so resolving it needs O(sqrt(Re)) cells
+            // across the body. Far below that the near-wall flow is modeled
+            // rather than computed — say so instead of printing a confident
+            // drag coefficient.
+            if let n = cellsPerFeature, let re, re > 1e3 {
+                let needed = 2.0 * re.squareRoot()
+                if Double(n) < needed {
+                    w.append(String(format: "%d cells across the body at Re %.0f — boundary layer NOT resolved (want ≳%.0f); forces are indicative only",
+                                    n, re, needed))
+                }
+            }
             return w
         }
     }
 
-    public func envelope(speed: Double, nu: Double) -> Envelope {
-        Envelope(mach: velocity(toLattice: speed) * 3.0.squareRoot(), tau: tau(nu: nu))
+    public func envelope(speed: Double, nu: Double,
+                         cellsPerFeature: Int? = nil) -> Envelope {
+        let re = cellsPerFeature.map { speed * dx * Double($0) / nu }
+        return Envelope(mach: velocity(toLattice: speed) * 3.0.squareRoot(),
+                        tau: tau(nu: nu), cellsPerFeature: cellsPerFeature, re: re)
     }
 }
