@@ -1,4 +1,4 @@
-# karman (working title)
+# Strouhal
 
 A Metal-native lattice-Boltzmann CFD engine for Apple silicon, built
 verification-first: **every claim the solver makes is backed by a gate it
@@ -45,9 +45,12 @@ Requires macOS 15+ on Apple silicon and Xcode command line tools.
 
 ```sh
 swift build -c release
-.build/release/karman m0      # spike gates: selftest, determinism, bench, cavity
-.build/release/karman m1      # + FP16, Poiseuille exact, Taylor-Green order
-.build/release/karman bench   # MLUPS on your machine, both precisions
+.build/release/strouhal m0      # spike gates: selftest, determinism, bench, cavity
+.build/release/strouhal m1      # + FP16, Poiseuille exact, Taylor-Green order
+.build/release/strouhal bench   # MLUPS on your machine, both precisions
+.build/release/strouhal m2      # the Kármán vortex street: Strouhal number, peaks, replay
+.build/release/strouhal m3      # STL voxelizer, 3D sphere wake
+.build/release/StrouhalApp      # the live instrument (three cases, real time)
 ```
 
 Every gate prints its measured value next to its threshold and its source
