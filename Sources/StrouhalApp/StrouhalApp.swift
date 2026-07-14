@@ -2,9 +2,26 @@ import SwiftUI
 import MetalKit
 import StrouhalCore
 
-// The instrument, M3: case picker (vortex street / cavity / 3D sphere),
-// SI-units + envelope readout, live QoIs with a drag sparkline, |u| slice
-// visualization. Compute and render share one queue (two-queue at M4).
+// The instrument's face (M5): one continuous dark surface — sidebar, field,
+// and truth strip share a single warm-charcoal canvas so components flow into
+// one another with no dividers or boxed strips. The only saturated color is
+// the physics itself (the ember colormap) and its matching amber accent;
+// hierarchy comes from luminance and type weight, never from lines. No
+// gradients anywhere in the chrome.
+
+/// The palette. Warm neutrals; amber accent (the field's hot end); sage for
+/// verified states; ember red for violated ones.
+enum Ink {
+    static let bg     = Color(red: 0.090, green: 0.086, blue: 0.082)
+    static let raised = Color(red: 0.132, green: 0.126, blue: 0.119)
+    static let hover  = Color(red: 0.165, green: 0.158, blue: 0.149)
+    static let text   = Color(red: 0.930, green: 0.910, blue: 0.880)
+    static let dim    = Color(red: 0.560, green: 0.540, blue: 0.515)
+    static let faint  = Color(red: 0.380, green: 0.365, blue: 0.348)
+    static let amber  = Color(red: 0.960, green: 0.630, blue: 0.220)
+    static let ember  = Color(red: 0.900, green: 0.360, blue: 0.190)
+    static let sage   = Color(red: 0.580, green: 0.740, blue: 0.460)
+}
 
 @main
 struct StrouhalApp: App {
@@ -15,8 +32,11 @@ struct StrouhalApp: App {
     }
     var body: some Scene {
         WindowGroup("Strouhal") {
-            ContentView().environmentObject(controller)
+            ContentView()
+                .environmentObject(controller)
+                .preferredColorScheme(.dark)
         }
+        .windowStyle(.hiddenTitleBar)
     }
 }
 
@@ -25,57 +45,34 @@ enum FlowCase: String, CaseIterable, Identifiable {
     case cavity = "Lid cavity (2D, Re 1000)"
     case sphere = "Sphere wake (3D, Re 100)"
     var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .street: "Vortex street"
+        case .cavity: "Lid cavity"
+        case .sphere: "Sphere wake"
+        }
+    }
+    var subtitle: String {
+        switch self {
+        case .street: "Kármán · 2D · Re 100"
+        case .cavity: "Ghia · 2D · Re 1000"
+        case .sphere: "3D · 192³ · Re 100"
+        }
+    }
 }
 
 struct ContentView: View {
     @EnvironmentObject var controller: SimController
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 16) {
-                Picker("Case", selection: $controller.selectedCase) {
-                    ForEach(FlowCase.allCases) { c in Text(c.rawValue).tag(c) }
-                }
-                .frame(width: 320)
-                Button(controller.running ? "Pause" : "Run") { controller.running.toggle() }
-                    .keyboardShortcut(.space, modifiers: [])
-                Button("Reset") { controller.reset() }
-                Slider(value: $controller.budgetMs, in: 2...30, step: 1) {
-                    Text("GPU budget/frame (ms)")
-                }.frame(width: 220)
-                Button("Import STL…") { controller.beginImport() }
-                Button("Export QoIs…") { controller.exportCSV() }
-                    .disabled(!controller.hasHistory)
-                Button(controller.hardening ? "Hardening…" : "Harden this number") {
-                    controller.harden()
-                }
-                .disabled(controller.hardening || !controller.canHarden)
-                Spacer()
+        HStack(spacing: 0) {
+            Sidebar()
+            VStack(spacing: 0) {
+                FieldView()
+                TruthStrip()
             }
-            .padding(10)
-            MetalView()
-                .aspectRatio(CGFloat(controller.aspect), contentMode: .fit)
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(controller.setupLine)
-                    Text(controller.envelopeLine)
-                }
-                .font(.system(.caption, design: .monospaced))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(controller.statsLine)
-                    Text(controller.qoiLine)
-                }
-                .font(.system(.caption, design: .monospaced))
-                SparklineView(values: controller.sparkline)
-                    .frame(width: 180, height: 34)
-                Spacer()
-            }
-            .padding(10)
-            Divider()
-            TruthPanel()
-                .padding(10)
         }
-        .frame(minWidth: 980, minHeight: 380)
-        .onChange(of: controller.selectedCase) { controller.selectBuiltin() }
+        .background(Ink.bg)
+        .frame(minWidth: 1080, minHeight: 640)
         .fileImporter(isPresented: $controller.showImporter,
                       allowedContentTypes: [.data, .item]) { result in
             if case .success(let url) = result { controller.stlChosen(url) }
@@ -86,74 +83,234 @@ struct ContentView: View {
     }
 }
 
-/// The mandatory units prompt: STL carries no units, and a silent unit
-/// error would poison every number downstream of a verification-first tool.
-struct UnitsSheet: View {
+// MARK: - Sidebar
+
+struct Sidebar: View {
     @EnvironmentObject var controller: SimController
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("STL has no units — define the physics")
-                .font(.headline)
-            Form {
-                TextField("Body length along x (m)", value: $controller.stlLengthM, format: .number)
-                TextField("Flow speed (m/s)", value: $controller.stlSpeedMS, format: .number)
-                Picker("Fluid", selection: $controller.stlFluid) {
-                    Text("Air (ν = 1.5e-5 m²/s)").tag(0)
-                    Text("Water (ν = 1.0e-6 m²/s)").tag(1)
+        VStack(alignment: .leading, spacing: 0) {
+            Text("STROUHAL")
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(3.5)
+                .foregroundStyle(Ink.dim)
+                .padding(.top, 46)
+                .padding(.leading, 22)
+
+            Text("CASES")
+                .font(.system(size: 9.5, weight: .semibold))
+                .tracking(1.6)
+                .foregroundStyle(Ink.faint)
+                .padding(.top, 30)
+                .padding(.leading, 22)
+                .padding(.bottom, 6)
+
+            ForEach(FlowCase.allCases) { fc in
+                CaseRow(title: fc.title, subtitle: fc.subtitle,
+                        selected: controller.selectedCase == fc && !controller.customActive) {
+                    controller.selectedCase = fc
+                    controller.selectBuiltin()
                 }
             }
-            Text(controller.stlPreview)
-                .font(.system(.caption, design: .monospaced))
-            HStack {
-                Spacer()
-                Button("Cancel") { controller.showUnitsSheet = false }
-                Button("Run") { controller.buildCustom() }
-                    .keyboardShortcut(.defaultAction)
+            CaseRow(title: controller.customName ?? "Custom body",
+                    subtitle: controller.customName != nil ? "imported STL" : "Import an STL…",
+                    selected: controller.customActive) {
+                controller.beginImport()
             }
+
+            Spacer(minLength: 12)
+            EnvelopeCard()
+            TransportBar()
         }
-        .padding(20)
-        .frame(width: 430)
+        .frame(width: 236)
     }
 }
 
-/// The truth panel: what the number is worth. Empty until you harden it —
-/// because an error bar the tool has not earned is worse than none.
-struct TruthPanel: View {
+struct CaseRow: View {
+    let title: String
+    let subtitle: String
+    let selected: Bool
+    let action: () -> Void
+    @State private var hovering = false
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(selected ? Ink.amber : .clear)
+                    .frame(width: 3, height: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: selected ? .semibold : .regular))
+                        .foregroundStyle(selected ? Ink.text : Ink.dim)
+                    Text(subtitle)
+                        .font(.system(size: 10.5))
+                        .foregroundStyle(Ink.faint)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.vertical, 7)
+            .padding(.leading, 10)
+            .background(selected ? Ink.raised : hovering ? Ink.raised.opacity(0.55) : .clear,
+                        in: RoundedRectangle(cornerRadius: 9))
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 1)
+    }
+}
+
+struct EnvelopeCard: View {
     @EnvironmentObject var controller: SimController
     var body: some View {
-        HStack(alignment: .top, spacing: 20) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Truth").font(.headline)
-                if controller.hardening {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text(controller.hardenStatus)
-                            .font(.system(.caption, design: .monospaced))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(controller.envelopeOK ? Ink.sage : Ink.ember)
+                    .frame(width: 7, height: 7)
+                Text(controller.envelopeOK ? "Within validity envelope" : "Envelope exceeded")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(controller.envelopeOK ? Ink.sage : Ink.ember)
+            }
+            Text(controller.machTauLine)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(Ink.dim)
+            ForEach(controller.envelopeWarnings, id: \.self) { w in
+                Text(w)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Ink.ember.opacity(0.92))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(Ink.raised, in: RoundedRectangle(cornerRadius: 10))
+        .padding(.horizontal, 12)
+    }
+}
+
+struct TransportBar: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Button {
+                    controller.running.toggle()
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: controller.running ? "pause.fill" : "play.fill")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text(controller.running ? "Pause" : "Run")
                     }
-                } else if let h = controller.headline {
-                    Text(h)
-                        .font(.system(.body, design: .monospaced).bold())
-                        .foregroundStyle(controller.outsideDomain ? .orange : .primary)
-                    ForEach(controller.truthLines, id: \.self) { line in
-                        Text(line).font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                    }
-                    Button("Save credibility report…") { controller.saveReport() }
-                        .padding(.top, 2)
-                } else if controller.canHarden {
-                    Text("Press “Harden this number” to run a resolution ladder and a Mach anchor (minutes) and earn an error bar.")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text("This case has no ladderable QoI yet.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(FillPill(prominent: !controller.running))
+                .keyboardShortcut(.space, modifiers: [])
+
+                Button {
+                    controller.reset()
+                } label: {
+                    Image(systemName: "arrow.counterclockwise")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(FillPill(prominent: false))
+                .help("Reset the case")
+            }
+            HStack(spacing: 8) {
+                Text("GPU budget")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Ink.faint)
+                Slider(value: $controller.budgetMs, in: 2...30, step: 1)
+                    .controlSize(.mini)
+                    .tint(Ink.amber)
+                Text("\(Int(controller.budgetMs)) ms")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(Ink.dim)
+                    .frame(width: 36, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+    }
+}
+
+// MARK: - Field
+
+struct FieldView: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        ZStack {
+            MetalView()
+                .aspectRatio(CGFloat(controller.aspect), contentMode: .fit)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            VStack(spacing: 0) {
+                HStack(alignment: .top) {
+                    Text(controller.setupLine)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Ink.dim)
+                    Spacer()
+                    Text(controller.perfLine)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Ink.faint)
+                }
+                .shadow(color: .black.opacity(0.85), radius: 3)
+                .padding(.horizontal, 18)
+                .padding(.top, 46)
+                Spacer()
+                QoIBand()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .layoutPriority(1)
+    }
+}
+
+/// Live quantities as instrument numerals, overlaid on the field's quiet edge.
+struct QoIBand: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        HStack(alignment: .lastTextBaseline, spacing: 30) {
+            if let cd = controller.liveCD { Numeral(label: "C_D", value: cd, format: "%.3f") }
+            if let cl = controller.liveCL { Numeral(label: "C_L", value: cl, format: "%+.3f") }
+            if let st = controller.liveSt { Numeral(label: "St", value: st, format: "%.3f") }
+            if !controller.staticQoI.isEmpty {
+                Text(controller.staticQoI)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Ink.dim)
             }
             Spacer()
+            if controller.sparkline.count > 2 {
+                Sparkline(values: controller.sparkline)
+                    .frame(width: 190, height: 36)
+                    .padding(.bottom, 4)
+            }
+        }
+        .shadow(color: .black.opacity(0.85), radius: 3)
+        .padding(.horizontal, 18)
+        .padding(.bottom, 14)
+    }
+}
+
+struct Numeral: View {
+    let label: String
+    let value: Double
+    let format: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .tracking(1.1)
+                .foregroundStyle(Ink.faint)
+            Text(String(format: format, value))
+                .font(.system(size: 27, weight: .medium, design: .monospaced))
+                .foregroundStyle(Ink.text)
+                .monospacedDigit()
         }
     }
 }
 
-struct SparklineView: View {
+struct Sparkline: View {
     let values: [Double]
     var body: some View {
         Canvas { ctx, size in
@@ -166,10 +323,192 @@ struct SparklineView: View {
                 if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
                 else { path.addLine(to: CGPoint(x: x, y: y)) }
             }
-            ctx.stroke(path, with: .color(.cyan), lineWidth: 1.2)
+            ctx.stroke(path, with: .color(Ink.amber.opacity(0.9)), lineWidth: 1.4)
         }
-        .background(Color.black.opacity(0.15))
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+}
+
+// MARK: - Truth strip
+
+/// What the number is worth. Quiet until you harden it — an error bar the
+/// tool has not earned is worse than none.
+struct TruthStrip: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        Group {
+            if controller.hardening {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small).tint(Ink.amber)
+                    Text("Hardening — \(controller.hardenStatus)")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(Ink.dim)
+                    Spacer()
+                }
+            } else if let value = controller.hardenedValue {
+                VStack(alignment: .leading, spacing: 7) {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        Text(controller.hardenedQoI)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Ink.dim)
+                        Text(String(format: "%.4f", value))
+                            .font(.system(size: 28, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Ink.text)
+                        if let u = controller.hardenedU {
+                            Text(String(format: "± %.4f", u))
+                                .font(.system(size: 20, weight: .medium, design: .monospaced))
+                                .foregroundStyle(Ink.amber)
+                            Text("k = 2")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(Ink.faint)
+                        } else {
+                            Text("outside the validated domain — no calibrated uncertainty")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Ink.ember)
+                        }
+                        Spacer()
+                        Button("Save report…") { controller.saveReport() }
+                            .buttonStyle(OutlinePill())
+                        Button("Export QoIs…") { controller.exportCSV() }
+                            .buttonStyle(OutlinePill())
+                            .disabled(!controller.hasHistory)
+                    }
+                    ForEach(controller.truthLines, id: \.self) { line in
+                        Text(line)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(Ink.dim)
+                    }
+                }
+            } else {
+                HStack(alignment: .center, spacing: 14) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("This number has no error bar yet.")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Ink.text)
+                        Text(controller.canHarden
+                             ? "Harden it: a resolution ladder and a Mach anchor, a few minutes on the GPU, and the number earns its uncertainty."
+                             : "This case has no ladderable QoI yet — the vortex street can be hardened.")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(Ink.faint)
+                    }
+                    Spacer()
+                    Button("Export QoIs…") { controller.exportCSV() }
+                        .buttonStyle(OutlinePill())
+                        .disabled(!controller.hasHistory)
+                    Button("Harden this number") { controller.harden() }
+                        .buttonStyle(FillPill(prominent: true))
+                        .disabled(!controller.canHarden)
+                }
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, minHeight: 92, alignment: .leading)
+    }
+}
+
+// MARK: - Units sheet
+
+/// The mandatory units prompt: STL carries no units, and a silent unit
+/// error would poison every number downstream of a verification-first tool.
+struct UnitsSheet: View {
+    @EnvironmentObject var controller: SimController
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Define the physics")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Ink.text)
+                Text("STL files carry no units. One wrong assumption here would silently poison every number downstream — so Strouhal asks.")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(Ink.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(spacing: 8) {
+                UnitsField(label: "Body length (m)", value: $controller.stlLengthM)
+                UnitsField(label: "Flow speed (m/s)", value: $controller.stlSpeedMS)
+                HStack {
+                    Text("Fluid")
+                        .font(.system(size: 12))
+                        .foregroundStyle(Ink.dim)
+                        .frame(width: 130, alignment: .leading)
+                    Picker("", selection: $controller.stlFluid) {
+                        Text("Air").tag(0)
+                        Text("Water").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                }
+            }
+            Text(controller.stlPreview)
+                .font(.system(size: 10.5, design: .monospaced))
+                .foregroundStyle(Ink.dim)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Spacer()
+                Button("Cancel") { controller.showUnitsSheet = false }
+                    .buttonStyle(OutlinePill())
+                Button {
+                    controller.buildCustom()
+                } label: {
+                    Text("Run").padding(.horizontal, 10)
+                }
+                .buttonStyle(FillPill(prominent: true))
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(22)
+        .frame(width: 470)
+        .background(Ink.bg)
+    }
+}
+
+struct UnitsField: View {
+    let label: String
+    @Binding var value: Double
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundStyle(Ink.dim)
+                .frame(width: 130, alignment: .leading)
+            TextField("", value: $value, format: .number)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundStyle(Ink.text)
+                .multilineTextAlignment(.trailing)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 10)
+                .background(Ink.raised, in: RoundedRectangle(cornerRadius: 7))
+        }
+    }
+}
+
+// MARK: - Button styles (flat, no gradients)
+
+struct FillPill: ButtonStyle {
+    var prominent: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 12, weight: .semibold))
+            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
+            .foregroundStyle(prominent ? Color.black.opacity(0.88) : Ink.text)
+            .background(prominent ? Ink.amber : Ink.raised,
+                        in: RoundedRectangle(cornerRadius: 8))
+            .opacity(configuration.isPressed ? 0.75 : 1)
+    }
+}
+
+struct OutlinePill: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 11.5, weight: .medium))
+            .padding(.vertical, 6)
+            .padding(.horizontal, 11)
+            .foregroundStyle(Ink.amber)
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Ink.amber.opacity(0.45), lineWidth: 1))
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -178,6 +517,7 @@ struct MetalView: NSViewRepresentable {
     func makeNSView(context: Context) -> MTKView {
         let view = MTKView(frame: .zero, device: controller.gpu.device)
         view.colorPixelFormat = .bgra8Unorm
+        view.clearColor = MTLClearColor(red: 0.090, green: 0.086, blue: 0.082, alpha: 1)
         view.preferredFramesPerSecond = 60
         view.delegate = controller
         return view
@@ -245,7 +585,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var outsideDomain = false
     private var lastRun: CredibilityRun?
     /// Only cases with a ladderable definition can be hardened.
-    var canHarden: Bool { selectedCase == .street && stlMesh == nil }
+    var canHarden: Bool { selectedCase == .street && !customActive }
     /// Rebuilds the current case (builtin picker choice or imported STL).
     private var currentBuilder: (() throws -> ActiveCase)!
     var hasHistory: Bool { !history.isEmpty }
@@ -263,6 +603,20 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
     @Published var setupLine = ""
     @Published var envelopeLine = ""
     @Published var sparkline: [Double] = []
+    // Structured readouts for the instrument face
+    @Published var perfLine = ""
+    @Published var liveCD: Double?
+    @Published var liveCL: Double?
+    @Published var liveSt: Double?
+    @Published var staticQoI = ""
+    @Published var envelopeOK = true
+    @Published var envelopeWarnings: [String] = []
+    @Published var machTauLine = ""
+    @Published var customActive = false
+    @Published var customName: String?
+    @Published var hardenedValue: Double?
+    @Published var hardenedU: Double?
+    @Published var hardenedQoI = ""
 
     private var frameCount = 0
     private var lastStatsTime = CACurrentMediaTime()
@@ -283,8 +637,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         (colorize, quad) = try! gpu.makeVizPipelines(precision: .fp32, pixelFormat: .bgra8Unorm)
         fieldTex = Self.makeFieldTexture(device: gpu.device, sim: active.sim)
         super.init()
-        setupLine = active.setupLine
-        envelopeLine = Self.envelopeText(active.envelope)
+        syncEnvelope()
         if let secs = ProcessInfo.processInfo.environment["STROUHAL_APP_SECONDS"],
            let t = Double(secs) {
             if let c = ProcessInfo.processInfo.environment["STROUHAL_APP_CASE"],
@@ -367,6 +720,14 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         }
     }
 
+    private func syncEnvelope() {
+        setupLine = active.setupLine
+        envelopeLine = Self.envelopeText(active.envelope)
+        envelopeOK = active.envelope.ok
+        envelopeWarnings = active.envelope.warnings
+        machTauLine = String(format: "Ma %.3f · τ %.4f", active.envelope.mach, active.envelope.tau)
+    }
+
     static func envelopeText(_ e: UnitScales.Envelope) -> String {
         let head = String(format: "Ma %.3f · τ %.4f", e.mach, e.tau)
         return e.ok ? head + " · ✓ within the method's validity envelope"
@@ -384,6 +745,7 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
 
     func selectBuiltin() {
         let c = selectedCase
+        customActive = false
         currentBuilder = { [gpu] in try Self.build(c, gpu: gpu) }
         reset()
     }
@@ -412,6 +774,8 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             try Self.buildSTLCase(gpu: gpu, mesh: mesh, name: name,
                                   lengthM: lengthM, speedMS: speedMS, nuSI: nu)
         }
+        customActive = true
+        customName = name
         reset()
     }
 
@@ -448,6 +812,9 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
         hardening = false
         let b = run.budget
         headline = b.headline
+        hardenedQoI = b.qoi
+        hardenedValue = b.value
+        hardenedU = b.combined.isNaN ? nil : b.combined
         if case .outside = b.verdict { outsideDomain = true } else { outsideDomain = false }
         var lines: [String] = []
         lines.append(String(format: "u_num %.4f · u_stat %.4f · u_Ma %.4f  →  U(φ) = k·√Σu² with k = 2",
@@ -573,8 +940,10 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             history.removeAll()
             sparkline = []
             qoiLine = ""
-            setupLine = active.setupLine
-            envelopeLine = Self.envelopeText(active.envelope)
+            liveCD = nil; liveCL = nil; liveSt = nil; staticQoI = ""
+            hardenedValue = nil; hardenedU = nil
+            truthLines = []; headline = nil
+            syncEnvelope()
         } catch {
             statsLine = "case build failed: \(error)"
         }
@@ -660,15 +1029,21 @@ final class SimController: NSObject, ObservableObject, MTKViewDelegate {
             let mlups = sps * Double(sim.cells) / 1e6
             statsLine = String(format: "%.0f fps · %.0f steps/s · %.0f MLUPS · step %d",
                                fps, sps, mlups, sim.stepsDone)
+            perfLine = String(format: "%.0f fps · %.0f MLUPS · step %d", fps, mlups, sim.stepsDone)
+            let st = strouhal()
+            liveCD = history.last?.cd
+            liveCL = active.strouhalD != nil ? history.last?.cl : nil
+            liveSt = st
+            staticQoI = active.qoiStatic?(sim) ?? ""
             var q = ""
             if let last = history.last {
                 q = String(format: "C_D %.3f", last.cd)
                 if active.strouhalD != nil { q += String(format: " · C_L %+.3f", last.cl) }
-                if let st = strouhal() { q += String(format: " · St %.3f", st) }
+                if let st { q += String(format: " · St %.3f", st) }
             }
-            if let staticQoI = active.qoiStatic {
+            if !staticQoI.isEmpty {
                 if !q.isEmpty { q += " · " }
-                q += staticQoI(sim)
+                q += staticQoI
             }
             qoiLine = q
             frameCount = 0; stepsSinceStats = 0; lastStatsTime = now

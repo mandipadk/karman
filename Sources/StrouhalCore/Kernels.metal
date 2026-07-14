@@ -434,10 +434,15 @@ struct VizParams {
 
 inline half3 speedColor(float s) {
     // three-stop map: deep navy -> cyan -> warm yellow
-    const float3 c0 = float3(0.05, 0.06, 0.20);
-    const float3 c1 = float3(0.10, 0.75, 0.85);
-    const float3 c2 = float3(1.00, 0.92, 0.35);
-    float3 c = (s < 0.5f) ? mix(c0, c1, s * 2.0f) : mix(c1, c2, (s - 0.5f) * 2.0f);
+    // Ember map: charcoal -> deep red -> orange -> pale amber. Monotone
+    // luminance (reads correctly in grayscale), no blue anywhere.
+    const float3 c0 = float3(0.055, 0.045, 0.040);
+    const float3 c1 = float3(0.420, 0.100, 0.050);
+    const float3 c2 = float3(0.900, 0.450, 0.100);
+    const float3 c3 = float3(1.000, 0.930, 0.780);
+    float3 c = (s < 0.35f) ? mix(c0, c1, s / 0.35f)
+             : (s < 0.70f) ? mix(c1, c2, (s - 0.35f) / 0.35f)
+                           : mix(c2, c3, (s - 0.70f) / 0.30f);
     return half3(c);
 }
 
@@ -454,12 +459,12 @@ kernel void colorize(device const float4* moments [[buffer(0)]],
     const float eps = (v.useEps != 0u) ? epsBuf[n] : 0.0f;
     half3 rgb;
     if (flag != FLAG_FLUID || eps >= 0.5f) {
-        rgb = half3(0.13h, 0.13h, 0.15h); // walls / bodies
+        rgb = half3(0.30h, 0.28h, 0.25h); // walls / bodies: warm slate
     } else {
         const float3 u = moments[n].xyz;
         const float s = clamp(length(u) / v.uref, 0.0f, 1.0f);
         rgb = speedColor(s);
-        if (eps > 0.0f) { rgb = mix(rgb, half3(0.13h), half(eps)); }
+        if (eps > 0.0f) { rgb = mix(rgb, half3(0.30h, 0.28h, 0.25h), half(eps)); }
     }
     tex.write(half4(rgb, 1.0h), uint2(gid.x, v.ny - 1u - gid.y)); // flip y
 }
